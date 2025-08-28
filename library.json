@@ -1,0 +1,23 @@
+{
+  "name": "ESP32_MCPWM",
+  "version": "1.0.0",
+  "description": "ESP32 dual H-bridge motor driver with MCPWM and soft-brake dithering.",
+  "keywords": ["motor", "mcpwm", "h-bridge", "esp32"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/LittleManBuilds/ESP32_MCPWM.git"
+  },
+  "authors": [
+    { "name": "Little Man Builds", "email": "littlemanbuilds@gmail.com", "maintainer": true }
+  ],
+  "license": "MIT",
+  "frameworks": ["arduino"],
+  "platforms": ["espressif32"],
+  "build": { "includeDir": "src" },
+  "examples": [
+    "examples/01_Basic_Drive/01_Basic_Drive.ino",
+    "examples/02_Braking_Overview/02_Braking_Overview.ino",
+    "examples/03_Advanced_Features/03_Advanced_Features.ino",
+    "examples/04_Two_Motors_Demo/04_Two_Motors_Demo.ino"
+  ]
+}

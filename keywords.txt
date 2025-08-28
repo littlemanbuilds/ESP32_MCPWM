@@ -1,0 +1,45 @@
+#######################################
+# Types / Classes
+#######################################
+HBridgeMotor            KEYWORD1
+IMotorDriver            KEYWORD1
+MotorMCPWMConfig        KEYWORD1
+MotorBehaviorConfig     KEYWORD1
+MotorSafetyConfig       KEYWORD1
+MotorCaptureConfig      KEYWORD1
+CaptureEdge             KEYWORD1
+Dir                     KEYWORD1
+FreewheelMode           KEYWORD1
+Motor                   KEYWORD1
+
+#######################################
+# Methods / Functions
+#######################################
+setup                   KEYWORD2
+setSpeed                KEYWORD2
+setFreewheel            KEYWORD2
+setHardBrake            KEYWORD2
+setSoftBrakePWM         KEYWORD2
+softBrakeNow            KEYWORD2
+getMaxPwmInput          KEYWORD2
+setFreewheelMode        KEYWORD2
+applyFreewheel          KEYWORD2
+start                   KEYWORD2
+stop                    KEYWORD2
+reconfigureFrequency    KEYWORD2
+hasFault                KEYWORD2
+clearFault              KEYWORD2
+forceOutputs            KEYWORD2
+changeDir               KEYWORD2
+
+#######################################
+# (Optional) Enum literals — may or may not highlight due to scoped enums
+#######################################
+CW                      LITERAL1
+CCW                     LITERAL1
+HiZ                     LITERAL1
+HiZ_Awake               LITERAL1
+DitherBrake             LITERAL1
+Rising                  LITERAL1
+Falling                 LITERAL1
+Both                    LITERAL1
