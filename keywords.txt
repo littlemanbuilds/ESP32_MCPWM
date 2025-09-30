@@ -10,6 +10,8 @@ MotorCaptureConfig      KEYWORD1
 CaptureEdge             KEYWORD1
 Dir                     KEYWORD1
 FreewheelMode           KEYWORD1
+FaultCallback           KEYWORD1
+CaptureCallback         KEYWORD1
 Motor                   KEYWORD1
 
 #######################################
@@ -17,10 +19,12 @@ Motor                   KEYWORD1
 #######################################
 setup                   KEYWORD2
 setSpeed                KEYWORD2
+setSpeedPercent         KEYWORD2
 setFreewheel            KEYWORD2
 setHardBrake            KEYWORD2
 setSoftBrakePWM         KEYWORD2
 softBrakeNow            KEYWORD2
+pollFaults              KEYWORD2
 getMaxPwmInput          KEYWORD2
 setFreewheelMode        KEYWORD2
 applyFreewheel          KEYWORD2
@@ -30,7 +34,17 @@ reconfigureFrequency    KEYWORD2
 hasFault                KEYWORD2
 clearFault              KEYWORD2
 forceOutputs            KEYWORD2
+setFaultCallback        KEYWORD2
 changeDir               KEYWORD2
+throttle                KEYWORD2
+brakeHard               KEYWORD2
+freewheel               KEYWORD2
+driver                  KEYWORD2
+
+#######################################
+# Constants / Macros
+#######################################
+ESP32_MCPWM_MOTOR_VERSION   LITERAL1
 
 #######################################
 # (Optional) Enum literals — may or may not highlight due to scoped enums

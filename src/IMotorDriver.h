@@ -56,6 +56,22 @@ struct MotorMCPWMConfig
           pwm_freq_hz(freq_hz), input_max(in_max) {}
 };
 
+// ---- Callbacks ----
+
+/**
+ * @brief User callback for period measurements (microseconds).
+ * @param period_us Measured period in microseconds between selected edges.
+ * @param user Opaque pointer supplied during registration.
+ */
+using CaptureCallback = void (*)(uint32_t period_us, void *user);
+
+/**
+ * @brief Fault event callback (level or latched).
+ * @param active True if a fault is currently active, false if it has cleared.
+ * @param ctx    Opaque pointer supplied during registration.
+ */
+using FaultCallback = void (*)(bool active, void *ctx);
+
 // ---- Optional Modules (software fallbacks) ----
 
 /**
@@ -79,9 +95,6 @@ enum class CaptureEdge : uint8_t
     Falling, ///< Capture on falling edges.
     Both     ///< Capture on both edges.
 };
-
-/// @brief User callback for period measurements (microseconds).
-using CaptureCallback = void (*)(uint32_t period_us, void *user);
 
 /**
  * @brief Optional capture configuration (period measurement).
@@ -266,6 +279,17 @@ public:
      * @param b_high True for high on B side.
      */
     virtual void forceOutputs(bool a_high, bool b_high) noexcept {}
+
+    /**
+     * @brief Optional fault notification callback (level or latched).
+     * @param cb  Callback: (active, ctx).
+     * @param ctx Opaque pointer (handed back).
+     */
+    virtual void setFaultCallback(FaultCallback cb, void *ctx) noexcept
+    {
+        (void)cb;
+        (void)ctx;
+    }
 
     /**
      * @brief Utility to invert direction.

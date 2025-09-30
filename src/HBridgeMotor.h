@@ -55,11 +55,11 @@ public:
      * @brief Initialize the driver with hardware, behavior, safety, and capture configs.
      * @param hw Hardware configuration for MCPWM and pins.
      * @param beh Behavior configuration (freewheel, soft-brake).
-     * @param sfty Optional safety (fault) configuration.
+     * @param safety Optional safety (fault) configuration.
      * @param cap Optional capture configuration.
      */
     void setup(const MotorMCPWMConfig &hw, const MotorBehaviorConfig &beh,
-               const MotorSafetyConfig &sfty, const MotorCaptureConfig &cap) override;
+               const MotorSafetyConfig &safety, const MotorCaptureConfig &cap) override;
 
     // ---- Core control ----
 
@@ -98,6 +98,11 @@ public:
      * @param pwm Requested soft-brake level.
      */
     void softBrakeNow(uint16_t pwm) noexcept;
+
+    /**
+     * @brief Process deferred fault actions and notify callback.
+     */
+    void pollFaults() noexcept;
 
     /**
      * @brief Get the maximum accepted logical PWM input.
@@ -158,6 +163,17 @@ public:
      */
     void forceOutputs(bool a_high, bool b_high) noexcept override;
 
+    /**
+     * @brief Optional fault notification callback (level or latched).
+     * @param cb Callback: (active, ctx).
+     * @param ctx Opaque pointer (handed back).
+     */
+    void setFaultCallback(FaultCallback cb, void *ctx) noexcept override
+    {
+        fault_cb_ = cb;
+        fault_ctx_ = ctx;
+    }
+
 private:
     // ---- Internal constants ----
     static constexpr double kMicrosPerSec = 1e6; ///< Conversion for Hz→µs.
@@ -175,6 +191,7 @@ private:
     void scheduleNextPhase() noexcept;      ///< Schedule next dither phase tick.
     void startSoftBrake() noexcept;         ///< Begin soft-brake dither.
     void stopSoftBrake() noexcept;          ///< Stop soft-brake dither.
+    int boundSoftHz(int hz) noexcept;       ///< Bound soft-brake frequency.
 
     // ---- GPIO / IO helpers ----
     void setEnable(bool on) noexcept;                        ///< Control optional EN pin.
@@ -202,7 +219,7 @@ private:
     mcpwm_io_signals_t mcpwm_sig_l_{MCPWM0A};  ///< MCPWM signal for LPWM.
     mcpwm_io_signals_t mcpwm_sig_r_{MCPWM0B};  ///< MCPWM signal for RPWM.
 
-    // Config mirrors.
+    // ---- Config mirrors ----
     int pwm_freq_hz_{20000};                              ///< PWM frequency (Hz).
     int input_max_{1023};                                 ///< Max logical input.
     float percent_per_count_{0.0f};                       ///< 100 / input_max.
@@ -210,14 +227,14 @@ private:
     bool dither_coast_hi_z_{false};                       ///< Dither brake coast uses Hi-Z (EN low) when true.
     mcpwm_counter_type_t counter_mode_{MCPWM_UP_COUNTER}; ///< Counter mode.
     MotorBehaviorConfig beh_{};                           ///< Behavior config.
-    MotorSafetyConfig sfty_{};                            ///< Safety config.
+    MotorSafetyConfig safety_{};                          ///< Safety config.
     MotorCaptureConfig cap_{};                            ///< Capture config.
 
-    // EN control.
+    // ---- EN control ----
     bool use_en_{false};   ///< True if EN pin is used.
     bool en_state_{false}; ///< Cached EN state.
 
-    // Soft-brake runtime.
+    // ---- Soft-brake runtime ----
     esp_timer_handle_t soft_timer_{nullptr};   ///< esp_timer used for dither.
     bool soft_active_{false};                  ///< True if dither is running.
     BrakePhase soft_phase_{BrakePhase::Coast}; ///< Current dither phase.
@@ -226,22 +243,27 @@ private:
     int64_t soft_us_brake_{0};                 ///< Brake phase duration (µs).
     int64_t soft_us_coast_{0};                 ///< Coast phase duration (µs).
     uint16_t soft_brake_pwm_{0};               ///< Current soft-brake PWM request.
+    static constexpr int kSoftHzMin = 50;      ///< Practical lower bound.
+    static constexpr int kSoftHzMax = 2000;    ///< Practical upper bound.
 
-    // Safety (fault).
+    // ---- Safety (fault) ----
     volatile bool fault_latched_{false}; ///< Latched fault state.
+    volatile bool fault_pending_{false}; ///< ISR posts work for task context.
+    FaultCallback fault_cb_{nullptr};    ///< User fault callback.
+    void *fault_ctx_{nullptr};           ///< User context pointer
 
-    // Capture (period measurement).
+    // ---- Capture (period measurement) ----
     volatile uint32_t last_edge_us_{0}; ///< Last edge timestamp (µs).
     volatile uint32_t period_us_{0};    ///< Measured period (µs).
 
-    // Concurrency & caching.
+    // ---- Concurrency & caching ----
     mutable portMUX_TYPE soft_mux_ = portMUX_INITIALIZER_UNLOCKED;             ///< Tiny critical section.
     inline void lockSoft() const noexcept { portENTER_CRITICAL(&soft_mux_); }  ///< Lock for soft state.
     inline void unlockSoft() const noexcept { portEXIT_CRITICAL(&soft_mux_); } ///< Unlock for soft state.
     float last_a_percent_{-1.0f};                                              ///< Cached last A duty.
     float last_b_percent_{-1.0f};                                              ///< Cached last B duty.
 
-    // Non-copyable.
+    // ---- Non-copyable ----
     HBridgeMotor(const HBridgeMotor &) = delete;            ///< No copy.
     HBridgeMotor &operator=(const HBridgeMotor &) = delete; ///< No assign.
 };

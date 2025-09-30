@@ -55,7 +55,7 @@ void HBridgeMotor::setup(const MotorMCPWMConfig &hw, const MotorBehaviorConfig &
 
 // Initialize the driver with hardware, behavior, safety, and capture configs.
 void HBridgeMotor::setup(const MotorMCPWMConfig &hw, const MotorBehaviorConfig &beh,
-                         const MotorSafetyConfig &sfty, const MotorCaptureConfig &cap)
+                         const MotorSafetyConfig &safety, const MotorCaptureConfig &cap)
 {
     // Pin & route mirrors.
     lpwm_pin_ = hw.lpwm_pin;
@@ -70,9 +70,9 @@ void HBridgeMotor::setup(const MotorMCPWMConfig &hw, const MotorBehaviorConfig &
     beh_ = beh;
     min_phase_us_ = beh_.min_phase_us;
     dither_coast_hi_z_ = beh_.dither_coast_hi_z;
-    sfty_ = sfty;
+    safety_ = safety;
     cap_ = cap;
-    soft_hz_ = beh_.soft_brake_hz;
+    soft_hz_ = boundSoftHz(beh_.soft_brake_hz);
     pwm_freq_hz_ = (hw.pwm_freq_hz > 0) ? hw.pwm_freq_hz : 20000;
     input_max_ = (hw.input_max > 0) ? hw.input_max : 1023;
     counter_mode_ = hw.counter;
@@ -126,10 +126,10 @@ void HBridgeMotor::setup(const MotorMCPWMConfig &hw, const MotorBehaviorConfig &
     }
 
     // Safety (software fallback).
-    if (sfty_.fault_gpio >= 0)
+    if (safety_.fault_gpio >= 0)
     {
-        pinMode(sfty_.fault_gpio, sfty_.fault_active_high ? INPUT_PULLDOWN : INPUT_PULLUP);
-        attachInterruptArg(sfty_.fault_gpio, &HBridgeMotor::faultISRThunk, this, CHANGE);
+        pinMode(safety_.fault_gpio, safety_.fault_active_high ? INPUT_PULLDOWN : INPUT_PULLUP);
+        attachInterruptArg(safety_.fault_gpio, &HBridgeMotor::faultISRThunk, this, CHANGE);
     }
 
     // Capture (software fallback).
@@ -217,7 +217,10 @@ void HBridgeMotor::setHardBrake() noexcept
 // Set the soft-brake PWM level (0..getMaxPwmInput()).
 void HBridgeMotor::setSoftBrakePWM(uint16_t pwm) noexcept
 {
-    soft_brake_pwm_ = static_cast<uint16_t>(clamp<int>(pwm, 0, input_max_));
+    const auto clamped = static_cast<uint16_t>(clamp<int>(pwm, 0, input_max_));
+    if (clamped == soft_brake_pwm_)
+        return; ///< No-op if unchanged.
+    soft_brake_pwm_ = clamped;
     if (soft_active_)
         recomputeSoftDurations();
 }
@@ -227,6 +230,24 @@ void HBridgeMotor::softBrakeNow(uint16_t pwm) noexcept
 {
     setSoftBrakePWM(pwm);
     startSoftBrake();
+}
+
+// Process deferred fault actions and notify callback.
+void HBridgeMotor::pollFaults() noexcept
+{
+    if (!fault_pending_)
+        return;
+    fault_pending_ = false;
+    if (fault_latched_)
+    {
+        emergencyBrake(); ///< Full stop.
+    }
+    else
+    {
+        clearFault(); ///< Back to safe idle.
+    }
+    if (fault_cb_)
+        fault_cb_(fault_latched_, fault_ctx_);
 }
 
 // Start the MCPWM outputs (0% duty).
@@ -320,9 +341,7 @@ void HBridgeMotor::scheduleNextPhase() noexcept
         unlockSoft();
         return;
     }
-    const int64_t dur_us = (soft_phase_ == BrakePhase::Brake) ? soft_us_brake_ : soft_us_coast_;
-    const int64_t min_us = static_cast<int64_t>(min_phase_us_);
-    const int64_t use_us = (dur_us < min_us) ? min_us : dur_us;
+    const int64_t use_us = (soft_phase_ == BrakePhase::Brake) ? soft_us_brake_ : soft_us_coast_;
     unlockSoft();
 
     (void)esp_timer_stop(soft_timer_);
@@ -370,6 +389,13 @@ void HBridgeMotor::stopSoftBrake() noexcept
         (void)esp_timer_stop(soft_timer_);
 }
 
+// Bound soft-brake frequency.
+int HBridgeMotor::boundSoftHz(int hz) noexcept
+{
+    return (hz < kSoftHzMin) ? kSoftHzMin : (hz > kSoftHzMax) ? kSoftHzMax
+                                                              : hz;
+}
+
 // Control optional EN pin.
 void HBridgeMotor::setEnable(bool on) noexcept
 {
@@ -406,16 +432,25 @@ void HBridgeMotor::recomputeSoftDurations() noexcept
 {
     const float lvl = clamp<float>(
         static_cast<float>(soft_brake_pwm_) / static_cast<float>(input_max_), 0.0f, 1.0f);
+    const int hz = (soft_hz_ <= 0) ? kSoftHzMin : soft_hz_; ///< Last-ditch guard.
 
-    const double period_us = kMicrosPerSec / static_cast<double>(soft_hz_);
-    int64_t br = static_cast<int64_t>(period_us * lvl);
-    int64_t co = static_cast<int64_t>(period_us) - br;
+    // Period in microseconds (integer for esp_timer).
+    const double period_us_f = kMicrosPerSec / static_cast<double>(hz);
+    const int64_t period_us = static_cast<int64_t>(period_us_f + 0.5);
 
-    const int64_t min_us = static_cast<int64_t>(min_phase_us_);
-    if (br < min_us && br > 0)
-        br = min_us;
-    if (co < min_us && co > 0)
-        co = min_us;
+    // Compute requested phase split (before enforcing minimums).
+    int64_t br = static_cast<int64_t>(period_us_f * static_cast<double>(lvl) + 0.5); ///< Brake phase.
+    int64_t co = period_us - br;                                                     ///< Coast phase.
+
+    // Cap the per-phase minimum to half the period so two minimums always fit.
+    const int64_t half_period = period_us / 2;
+    const int64_t min_us_cap = (min_phase_us_ > half_period) ? half_period : static_cast<int64_t>(min_phase_us_);
+
+    // Enforce minimums when a phase is nonzero (keeps duty meaningful at high Hz).
+    if (br > 0 && br < min_us_cap)
+        br = min_us_cap;
+    if (co > 0 && co < min_us_cap)
+        co = min_us_cap;
 
     lockSoft();
     soft_level_ = lvl;
@@ -430,27 +465,22 @@ void IRAM_ATTR HBridgeMotor::faultISRThunk(void *arg) { static_cast<HBridgeMotor
 // Fault ISR.
 void IRAM_ATTR HBridgeMotor::faultISR() noexcept
 {
-    const int level = gpio_get_level(static_cast<gpio_num_t>(sfty_.fault_gpio));
-    const bool active = sfty_.fault_active_high ? (level != 0) : (level == 0);
+    const int level = gpio_get_level(static_cast<gpio_num_t>(safety_.fault_gpio));
+    const bool active = safety_.fault_active_high ? (level != 0) : (level == 0);
 
-    if (sfty_.oneshot)
+    if (safety_.oneshot)
     {
         if (active && !fault_latched_)
         {
             fault_latched_ = true;
-            emergencyBrake();
+            fault_pending_ = true; // defer handling to task context
         }
     }
     else
     {
-        if (active)
-        {
-            emergencyBrake();
-        }
-        else
-        {
-            clearFault();
-        }
+        // Level-following mode.
+        fault_latched_ = active;
+        fault_pending_ = true;
     }
 }
 

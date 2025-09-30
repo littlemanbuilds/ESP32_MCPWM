@@ -39,7 +39,7 @@ Motor motor;
 
 void setup() {
   Serial.begin(115200);
-  motor.setup(cfg);   // If EN is unused, defaults to HiZ_Awake for stability.
+  motor.setup(cfg);   // If EN is unused (`-1`), the driver defaults to **HiZ_Awake** so outputs remain stable.
 }
 
 void loop() {
@@ -85,6 +85,8 @@ void loop() {
 - `MotorCaptureConfig` — optional capture input config  
 - `Dir` — `CW` or `CCW`  
 - `FreewheelMode` — `HiZ`, `HiZ_Awake`, `DitherBrake`
+- `CaptureCallback` — ISR callback for period measurements
+- `FaultCallback` — ISR callback for fault events
 
 ### Methods (common surface)
 
@@ -97,10 +99,12 @@ void setup(const MotorMCPWMConfig& hw, const MotorBehaviorConfig& beh,
 
 // Control
 void setSpeed(int speed, Dir dir) noexcept;   // 0 => stop per behavior
+void setSpeedPercent(float percent, Dir dir) noexcept; // 0..100
 void setFreewheel() noexcept;                 // Apply current freewheel mode
 void setHardBrake() noexcept;                 // Dynamic brake (A/B = 100%)
 void setSoftBrakePWM(uint16_t pwm) noexcept;  // Tune dither strength
 void softBrakeNow(uint16_t pwm) noexcept;     // Start dither immediately
+void pollFaults() noexcept;                      // Process deferred fault actions (call in loop)
 
 // Behavior
 void setFreewheelMode(FreewheelMode m) noexcept;
@@ -115,6 +119,7 @@ bool reconfigureFrequency(int new_hz) noexcept;
 bool hasFault() const noexcept;
 void clearFault() noexcept;
 void forceOutputs(bool a_high, bool b_high) noexcept;
+void setFaultCallback(FaultCallback cb, void* ctx) noexcept;
 
 // Info
 int getMaxPwmInput() const noexcept;  // Mirrors cfg.input_max (default 1023)
@@ -152,7 +157,7 @@ hw.deadtime_fed_ns = 500;
 ```cpp
 MotorBehaviorConfig beh{
   /* freewheel_mode    */ FreewheelMode::HiZ, // or HiZ_Awake / DitherBrake
-  /* soft_brake_hz     */ 60,                 // dither frequency (Hz)
+  /* soft_brake_hz     */ 60,                 // dither frequency (Hz). Internally bounded to [50, 2000 Hz] for stability.
   /* dither_pwm        */ 0,                  // set at runtime with setSoftBrakePWM()
   /* default_soft      */ 0,                  // dither automatically when speed→0
   /* min_phase_us      */ 600,                // minimum slice per half-cycle (µs)
