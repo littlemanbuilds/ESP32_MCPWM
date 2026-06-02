@@ -15,8 +15,8 @@
 #include <ESP32_MCPWM.h>
 
 /**
- * @brief Note: GPIO 34-39 on a standard ESP32 are input only!
- *  Tested with an ESP32-S3.
+ * @brief Note: GPIO 34-39 on the original ESP32 are input only.
+ *  Tested with an ESP32-S3 DevKitC-1; adjust pins for your board.
  */
 #define LPWM_PIN 37
 #define RPWM_PIN 38
@@ -47,7 +47,7 @@ MotorSafetyConfig safety; ///< Defaults - wire if you want to test oneshot latch
 
 // ---- Capture (optional) : assign in setup ----
 volatile uint32_t g_lastPeriodUs = 0;
-static void onCapture(uint32_t us, void *) { g_lastPeriodUs = us; }
+static void IRAM_ATTR onCapture(uint32_t us, void *) { g_lastPeriodUs = us; }
 MotorCaptureConfig cap; ///< Set CAP_PIN if enabled.
 
 Motor motor;
@@ -161,7 +161,8 @@ void loop()
   // motor.forceOutputs(false, false);
   // delay(100);
 
-  // Fault handling (if wired).
+  // Fault handling (if wired). pollFaults() applies the deferred action from task context.
+  motor.pollFaults();
   if (motor.hasFault())
   {
     Serial.println("[Fault] Latched. Clearing to safe idle.");

@@ -40,12 +40,19 @@ public:
 
     /**
      * @brief Initialize the driver with hardware configuration.
+     *
+     * Safe to call again: prior soft-brake timing is stopped and any attached
+     * fault/capture GPIO interrupts are detached before the new setup is applied.
+     *
      * @param hw Hardware configuration for MCPWM and pins.
      */
     void setup(const MotorMCPWMConfig &hw) override;
 
     /**
      * @brief Initialize the driver with hardware and behavior configuration.
+     *
+     * Safe to call again; previous optional fault/capture interrupts are cleaned up.
+     *
      * @param hw Hardware configuration for MCPWM and pins.
      * @param beh Behavior configuration (freewheel, soft-brake).
      */
@@ -53,6 +60,9 @@ public:
 
     /**
      * @brief Initialize the driver with hardware, behavior, safety, and capture configs.
+     *
+     * Safe to call again; previous optional fault/capture interrupts are cleaned up.
+     *
      * @param hw Hardware configuration for MCPWM and pins.
      * @param beh Behavior configuration (freewheel, soft-brake).
      * @param safety Optional safety (fault) configuration.
@@ -186,7 +196,7 @@ private:
         Brake  ///< Braking phase.
     };
 
-    void softBrakeISR() noexcept;           ///< Timer ISR trampoline for soft-brake toggling.
+    void softBrakeTimerTask() noexcept;     ///< esp_timer task callback for soft-brake toggling.
     void applyPhase(BrakePhase p) noexcept; ///< Apply current soft-brake phase.
     void scheduleNextPhase() noexcept;      ///< Schedule next dither phase tick.
     void startSoftBrake() noexcept;         ///< Begin soft-brake dither.
@@ -204,10 +214,15 @@ private:
     static void IRAM_ATTR faultISRThunk(void *arg); ///< Static thunk to instance ISR.
     void IRAM_ATTR faultISR() noexcept;             ///< Fault ISR.
     void emergencyBrake() noexcept;                 ///< Immediate full electronic brake.
+    void detachFaultInterrupt() noexcept;           ///< Detach prior fault interrupt, if any.
 
     // ---- Capture (software fallback) ----
     static void IRAM_ATTR capISRThunk(void *arg); ///< Static thunk to instance ISR.
     void IRAM_ATTR capISR() noexcept;             ///< Capture ISR.
+    void detachCaptureInterrupt() noexcept;       ///< Detach prior capture interrupt, if any.
+
+    // ---- Setup / teardown helpers ----
+    void prepareForSetup() noexcept; ///< Make repeated setup() calls safe.
 
     // ---- State (hardware & behavior) ----
     // Pins & routing.
@@ -229,6 +244,7 @@ private:
     MotorBehaviorConfig beh_{};                           ///< Behavior config.
     MotorSafetyConfig safety_{};                          ///< Safety config.
     MotorCaptureConfig cap_{};                            ///< Capture config.
+    bool setup_done_{false};                              ///< True after MCPWM setup has completed.
 
     // ---- EN control ----
     bool use_en_{false};   ///< True if EN pin is used.
@@ -250,11 +266,13 @@ private:
     volatile bool fault_latched_{false}; ///< Latched fault state.
     volatile bool fault_pending_{false}; ///< ISR posts work for task context.
     FaultCallback fault_cb_{nullptr};    ///< User fault callback.
-    void *fault_ctx_{nullptr};           ///< User context pointer
+    void *fault_ctx_{nullptr};           ///< User context pointer.
+    int fault_irq_pin_{-1};              ///< Attached fault interrupt pin.
 
     // ---- Capture (period measurement) ----
     volatile uint32_t last_edge_us_{0}; ///< Last edge timestamp (µs).
     volatile uint32_t period_us_{0};    ///< Measured period (µs).
+    int cap_irq_pin_{-1};               ///< Attached capture interrupt pin.
 
     // ---- Concurrency & caching ----
     mutable portMUX_TYPE soft_mux_ = portMUX_INITIALIZER_UNLOCKED;             ///< Tiny critical section.

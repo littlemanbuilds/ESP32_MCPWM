@@ -11,8 +11,8 @@
 #include <ESP32_MCPWM.h>
 
 /**
- * @brief Note: GPIO 34-39 on a standard ESP32 are input only!
- *  Tested with an ESP32-S3.
+ * @brief Note: GPIO 34-39 on the original ESP32 are input only.
+ *  Tested with an ESP32-S3 DevKitC-1; adjust pins for your board.
  */
 #define LPWM_PIN 37
 #define RPWM_PIN 38

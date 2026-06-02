@@ -24,6 +24,8 @@ static inline T clamp(T v, T lo, T hi)
 // Virtual destructor for safe polymorphic deletion.
 HBridgeMotor::~HBridgeMotor() noexcept
 {
+    detachFaultInterrupt();
+    detachCaptureInterrupt();
     stopSoftBrake();
     if (soft_timer_)
     {
@@ -57,6 +59,8 @@ void HBridgeMotor::setup(const MotorMCPWMConfig &hw, const MotorBehaviorConfig &
 void HBridgeMotor::setup(const MotorMCPWMConfig &hw, const MotorBehaviorConfig &beh,
                          const MotorSafetyConfig &safety, const MotorCaptureConfig &cap)
 {
+    prepareForSetup();
+
     // Pin & route mirrors.
     lpwm_pin_ = hw.lpwm_pin;
     rpwm_pin_ = hw.rpwm_pin;
@@ -118,7 +122,7 @@ void HBridgeMotor::setup(const MotorMCPWMConfig &hw, const MotorBehaviorConfig &
     {
         esp_timer_create_args_t args{};
         args.callback = [](void *p)
-        { static_cast<HBridgeMotor *>(p)->softBrakeISR(); };
+        { static_cast<HBridgeMotor *>(p)->softBrakeTimerTask(); };
         args.arg = this;
         args.dispatch_method = ESP_TIMER_TASK;
         args.name = "soft_brake";
@@ -130,6 +134,7 @@ void HBridgeMotor::setup(const MotorMCPWMConfig &hw, const MotorBehaviorConfig &
     {
         pinMode(safety_.fault_gpio, safety_.fault_active_high ? INPUT_PULLDOWN : INPUT_PULLUP);
         attachInterruptArg(safety_.fault_gpio, &HBridgeMotor::faultISRThunk, this, CHANGE);
+        fault_irq_pin_ = safety_.fault_gpio;
     }
 
     // Capture (software fallback).
@@ -141,7 +146,10 @@ void HBridgeMotor::setup(const MotorMCPWMConfig &hw, const MotorBehaviorConfig &
                          : (cap_.edge == CaptureEdge::Falling) ? FALLING
                                                                : CHANGE;
         attachInterruptArg(cap_.cap_gpio, &HBridgeMotor::capISRThunk, this, mode);
+        cap_irq_pin_ = cap_.cap_gpio;
     }
+
+    setup_done_ = true;
 }
 
 // Set speed and direction.
@@ -240,7 +248,7 @@ void HBridgeMotor::pollFaults() noexcept
     fault_pending_ = false;
     if (fault_latched_)
     {
-        emergencyBrake(); ///< Full stop.
+        emergencyBrake(); ///< Hold electronic brake.
     }
     else
     {
@@ -295,8 +303,8 @@ void HBridgeMotor::forceOutputs(bool a_high, bool b_high) noexcept
     writeAB(a_high ? 100.0f : 0.0f, b_high ? 100.0f : 0.0f);
 }
 
-// esp_timer callback → toggle phase and reschedule.
-void HBridgeMotor::softBrakeISR() noexcept
+// esp_timer task callback → toggle phase and reschedule.
+void HBridgeMotor::softBrakeTimerTask() noexcept
 {
     lockSoft();
     if (!soft_active_)
@@ -381,11 +389,10 @@ void HBridgeMotor::startSoftBrake() noexcept
 void HBridgeMotor::stopSoftBrake() noexcept
 {
     lockSoft();
-    const bool was_active = soft_active_;
     soft_active_ = false;
     unlockSoft();
 
-    if (was_active)
+    if (soft_timer_)
         (void)esp_timer_stop(soft_timer_);
 }
 
@@ -490,7 +497,18 @@ void HBridgeMotor::emergencyBrake() noexcept
     stopSoftBrake();
     setEnable(true);
     writeAB(100.0f, 100.0f);
-    (void)mcpwm_stop(mcpwm_unit_, mcpwm_timer_);
+    // Keep MCPWM running so the bridge continues to hold the electronic brake.
+    (void)mcpwm_start(mcpwm_unit_, mcpwm_timer_);
+}
+
+// Detach prior fault interrupt, if any.
+void HBridgeMotor::detachFaultInterrupt() noexcept
+{
+    if (fault_irq_pin_ >= 0)
+    {
+        detachInterrupt(fault_irq_pin_);
+        fault_irq_pin_ = -1;
+    }
 }
 
 // Static thunk to instance ISR.
@@ -514,6 +532,39 @@ void IRAM_ATTR HBridgeMotor::capISR() noexcept
     }
 }
 
+// Detach prior capture interrupt, if any.
+void HBridgeMotor::detachCaptureInterrupt() noexcept
+{
+    if (cap_irq_pin_ >= 0)
+    {
+        detachInterrupt(cap_irq_pin_);
+        cap_irq_pin_ = -1;
+    }
+}
+
+// Make repeated setup() calls safe.
+void HBridgeMotor::prepareForSetup() noexcept
+{
+    detachFaultInterrupt();
+    detachCaptureInterrupt();
+    stopSoftBrake();
+
+    if (setup_done_)
+    {
+        setEnable(false);
+        writeAB(0.0f, 0.0f);
+        (void)mcpwm_stop(mcpwm_unit_, mcpwm_timer_);
+    }
+
+    fault_latched_ = false;
+    fault_pending_ = false;
+    last_edge_us_ = 0;
+    period_us_ = 0;
+    last_a_percent_ = -1.0f;
+    last_b_percent_ = -1.0f;
+    setup_done_ = false;
+}
+
 // Set the freewheel mode for subsequent setFreewheel() calls.
 void HBridgeMotor::setFreewheelMode(FreewheelMode m) noexcept
 {
@@ -524,7 +575,7 @@ void HBridgeMotor::setFreewheelMode(FreewheelMode m) noexcept
     soft_active_ = false;
     unlockSoft();
 
-    if (change && was_active)
+    if (change && was_active && soft_timer_)
         (void)esp_timer_stop(soft_timer_);
 }
 

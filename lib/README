@@ -1,4 +1,12 @@
 
+ESP32_MCPWM target note
+-----------------------
+
+This repository is for an Arduino-ESP32 library built around the ESP32 MCPWM
+peripheral. The release examples are tested on an ESP32-S3 DevKitC-1; ESP32-only
+features include MCPWM routing/timers, esp_timer soft-brake scheduling, and GPIO
+fault/capture interrupt fallbacks.
+
 This directory is intended for project specific (private) libraries.
 PlatformIO will compile them to static libraries and link into the executable file.
 

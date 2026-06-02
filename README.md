@@ -1,13 +1,24 @@
 # ESP32_MCPWM
 
 Arduino-friendly dual H-bridge motor driver for ESP32 using the **MCPWM** peripheral (not LEDC).  
-Smooth, predictable control with configurable **freewheel modes**, **hard/soft braking**, optional **center-aligned PWM**, and ISR fallbacks for **fault** and **capture**.
+Smooth, predictable control with configurable **freewheel modes**, **hard/soft braking**, optional **center-aligned PWM**, and GPIO-interrupt fallbacks for **fault** and **capture**.
 
 - ✅ Arduino Library Manager ready  
 - ✅ Beginner alias: `Motor` → `HBridgeMotor`  
 - ✅ Works with **BTS7960 / IBT-2** and **DRV8871** (and similar)  
-- ✅ FreeRTOS-friendly, ISR-safe design  
+- ✅ FreeRTOS-friendly with tiny GPIO ISRs and task-context fault handling
 - ✅ MIT Licensed  
+
+---
+
+## Targets and ESP32 Scope
+
+This is intentionally an **ESP32 / Arduino-ESP32** library. It uses Espressif MCPWM (`driver/mcpwm.h`), `esp_timer`, FreeRTOS critical sections, and Arduino-ESP32 GPIO interrupts. It is **not** a fake-portable AVR/SAMD/RP2040/ESP8266 motor API.
+
+- **Supported target family:** ESP32-family boards supported by Arduino-ESP32 with the legacy MCPWM driver available.
+- **Tested for this release:** ESP32-S3 DevKitC-1 via PlatformIO (`esp32-s3-devkitc-1`).
+- **ESP32-only features:** MCPWM timer/signal routing, center-aligned counter mode, dead-time configuration, runtime MCPWM frequency retune, `esp_timer` soft-brake scheduling, and GPIO fault/capture interrupt fallbacks.
+- **Pin note:** GPIO 34-39 are input-only on the original ESP32; ESP32-S2/S3/C-series boards have different pin maps. Adjust example pins for your board.
 
 ---
 
@@ -66,8 +77,8 @@ void loop() {
 - **Hard brake:** dynamic short (A=100%, B=100%) for fast stops.  
 - **Center-aligned option:** set `counter = MCPWM_UP_DOWN_COUNTER`.  
 - **Runtime frequency retune:** `reconfigureFrequency(new_hz)`.  
-- **Safety fallback:** fault input ISR (oneshot or level-follow).  
-- **Capture fallback:** edge-timed period measurement callback.  
+- **Safety fallback:** fault GPIO interrupt (oneshot or level-follow), with action deferred to `pollFaults()`.
+- **Capture fallback:** edge-timed GPIO interrupt period callback.
 - **Performance niceties:** duty caching, small critical section, wrap-safe time math.  
 
 ---
@@ -85,8 +96,8 @@ void loop() {
 - `MotorCaptureConfig` — optional capture input config  
 - `Dir` — `CW` or `CCW`  
 - `FreewheelMode` — `HiZ`, `HiZ_Awake`, `DitherBrake`
-- `CaptureCallback` — ISR callback for period measurements
-- `FaultCallback` — ISR callback for fault events
+- `CaptureCallback` — GPIO ISR callback for period measurements (IRAM-safe/non-blocking)
+- `FaultCallback` — task-context callback for fault events, run from `pollFaults()`
 
 ### Methods (common surface)
 
@@ -114,6 +125,10 @@ void applyFreewheel(FreewheelMode m) noexcept;
 void start() noexcept;
 void stop() noexcept;
 bool reconfigureFrequency(int new_hz) noexcept;
+
+// Re-setup note:
+// Calling setup(...) again on the same object is allowed; the previous
+// soft-brake timer state and optional fault/capture interrupts are cleaned up first.
 
 // Safety & raw outputs
 bool hasFault() const noexcept;
@@ -190,7 +205,7 @@ MotorCaptureConfig cap;
 cap.cap_gpio   = 5;                      // -1 to disable
 cap.edge       = CaptureEdge::Rising;    // Rising/Falling/Both
 cap.on_capture = [](uint32_t period_us, void* user){
-  // ISR context: keep it short.
+  // GPIO ISR context: IRAM-safe, short, and non-blocking only.
 };
 cap.user = nullptr;
 ```
@@ -272,7 +287,7 @@ hw.counter = MCPWM_UP_DOWN_COUNTER; // center-aligned OK
 
 ## Fault Handling (Software Fallback)
 
-The library can watch a **fault GPIO** and either **latch** on first event or **follow level**.
+The library can watch a **fault GPIO** and either **latch** on first event or **follow level**. The GPIO ISR only records the event; call `pollFaults()` from `loop()` to apply the brake/clear action and run the optional fault callback in normal task context.
 
 - **Oneshot (latched):** set `sfty.oneshot = true`. First active edge → **hard brake** and `hasFault() == true` until you call `clearFault()`.
 - **Level-follow:** set `sfty.oneshot = false`. When the input is active → **hard brake**; when inactive → cleared automatically.
@@ -286,14 +301,15 @@ sfty.oneshot           = true;  // latch
 
 motor.setup(hw, beh, sfty, MotorCaptureConfig{});
 
-// Later:
+// In loop():
+motor.pollFaults();      // applies deferred fault action from task context
 if (motor.hasFault()) {
   Serial.println("Fault latched, clearing…");
-  motor.clearFault();     // returns to a safe idle (Awake-HiZ)
+  motor.clearFault();     // returns to safe idle (A/B = 0)
 }
 ```
 
-**Tip:** debounce at the source if your fault source is noisy; the ISR is intentionally minimal.
+**Tip:** debounce at the source if your fault source is noisy; the GPIO ISR is intentionally minimal.
 
 ---
 
@@ -302,13 +318,13 @@ if (motor.hasFault()) {
 Capture measures the **time between edges** on a GPIO using `micros()` from an ISR. It’s lightweight and good for tachs or timing marks.
 
 - Choose edge: `Rising`, `Falling`, or `Both`.  
-- Provide a tiny ISR callback (keep it short).  
+- Provide a tiny GPIO ISR callback: IRAM-safe, short, non-blocking, and no `Serial`, allocation, `delay()`, or locks.
 - Read your last period in the main loop.
 
 Example:
 ```cpp
 volatile uint32_t last_period_us = 0;
-static void onCap(uint32_t us, void*) { last_period_us = us; }  // ISR context
+static void IRAM_ATTR onCap(uint32_t us, void*) { last_period_us = us; }  // GPIO ISR context
 
 MotorCaptureConfig cap;
 cap.cap_gpio   = 5;
@@ -325,7 +341,7 @@ if (last_period_us) {
 }
 ```
 
-**Note:** the software path avoids MCPWM’s internal capture unit for portability; if you need hardware capture, you can swap in an IDF-native implementation behind the same config later.
+**Note:** the software path avoids MCPWM’s internal capture unit to keep the example simple across ESP32 board variants. It is still Arduino-ESP32-specific; if you need hardware capture, swap in an IDF-native implementation behind the same config.
 
 ---
 
@@ -373,16 +389,19 @@ hw.counter      = MCPWM_UP_DOWN_COUNTER; // center-aligned
 MotorSafetyConfig sfty; sfty.fault_gpio = 4; sfty.fault_active_high = true; sfty.oneshot = true;
 MotorCaptureConfig cap; cap.cap_gpio = 5; cap.edge = CaptureEdge::Rising; cap.on_capture = &onCap;
 motor.setup(hw, beh, sfty, cap);
+
+// In loop():
+motor.pollFaults();
 ```
 
 ---
 
 ## Notes & Tips
 
-- Pins **34–39 on a standard ESP32 are input-only**. Use an output-capable GPIO for EN or set `en_pin=-1` and hard-wire EN high. I have tested the code with an **ESP32-S3!  
+- Pins **34–39 on the original ESP32 are input-only**. Use an output-capable GPIO for EN or set `en_pin=-1` and hard-wire EN high. The examples in this release were tested on an **ESP32-S3 DevKitC-1**; adjust pins for your board.
 - **Input range:** `getMaxPwmInput()` mirrors your configured `input_max` (default **1023**).  
 - **Time types:** prefer fixed-width types like `uint32_t` for `millis()`/`micros()` math.  
-- **Threading:** small critical section around soft-brake state; keep ISRs minimal.  
+- **Threading:** small critical section around soft-brake state; keep GPIO ISRs minimal and capture callbacks IRAM-safe/non-blocking.
 - **Audible noise:** dither audibility depends on `soft_brake_hz` and `min_phase_us`—tune them together.
 
 ---

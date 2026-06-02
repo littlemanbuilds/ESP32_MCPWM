@@ -1,6 +1,6 @@
 {
   "name": "ESP32_MCPWM",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "ESP32 dual H-bridge motor driver with MCPWM and soft-brake dithering.",
   "keywords": ["motor", "mcpwm", "h-bridge", "esp32"],
   "repository": {

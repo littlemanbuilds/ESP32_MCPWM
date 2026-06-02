@@ -60,6 +60,10 @@ struct MotorMCPWMConfig
 
 /**
  * @brief User callback for period measurements (microseconds).
+ *
+ * Called from GPIO interrupt context on Arduino-ESP32; keep it IRAM-safe,
+ * short, and non-blocking (no Serial, allocation, delay, or locks).
+ *
  * @param period_us Measured period in microseconds between selected edges.
  * @param user Opaque pointer supplied during registration.
  */
@@ -67,6 +71,9 @@ using CaptureCallback = void (*)(uint32_t period_us, void *user);
 
 /**
  * @brief Fault event callback (level or latched).
+ *
+ * Called from pollFaults() in task context, after the tiny GPIO ISR posts work.
+ *
  * @param active True if a fault is currently active, false if it has cleared.
  * @param ctx    Opaque pointer supplied during registration.
  */
@@ -100,6 +107,8 @@ enum class CaptureEdge : uint8_t
  * @brief Optional capture configuration (period measurement).
  *
  * If @p cap_gpio >= 0, an ISR measures period via micros() on the selected edge.
+ * The optional callback also runs in that ISR context and must be IRAM-safe,
+ * short, and non-blocking.
  */
 struct MotorCaptureConfig
 {
