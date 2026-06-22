@@ -33,8 +33,8 @@ struct MotorMCPWMConfig
     mcpwm_io_signals_t sig_r = MCPWM0B;  ///< MCPWM signal for RPWM.
 
     // Timing / scaling
-    int pwm_freq_hz = 20000;                         ///< PWM frequency (Hz).
-    int input_max = 1023;                            ///< Max logical input (e.g., 1023).
+    int pwm_freq_hz = 20000;                         ///< Drive PWM frequency in Hz (validated at setup).
+    int input_max = 1023;                            ///< Max logical input; valid range 1..65535.
     mcpwm_counter_type_t counter = MCPWM_UP_COUNTER; ///< MCPWM counter mode.
 
     // Dead-time (optional). Safe defaults: off.
@@ -43,10 +43,23 @@ struct MotorMCPWMConfig
     uint32_t deadtime_red_ns = 500;                                          ///< Rising-edge delay (ns).
     uint32_t deadtime_fed_ns = 500;                                          ///< Falling-edge delay (ns).
 
-    /// @brief Convenience constructor; keeps legacy brace-init working.
+    /**
+     * @brief Construct the default unassigned hardware configuration.
+     */
     MotorMCPWMConfig() = default;
 
-    /// @brief Convenience constructor with optional frequency and input max.
+    /**
+     * @brief Construct a hardware configuration with MCPWM routing.
+     * @param lp GPIO for LPWM.
+     * @param rp GPIO for RPWM.
+     * @param en GPIO for EN, or -1 when unused.
+     * @param u MCPWM unit.
+     * @param t MCPWM timer.
+     * @param sl MCPWM signal routed to LPWM.
+     * @param sr MCPWM signal routed to RPWM.
+     * @param freq_hz Drive PWM frequency in hertz.
+     * @param in_max Maximum logical PWM input.
+     */
     MotorMCPWMConfig(int lp, int rp, int en,
                      mcpwm_unit_t u, mcpwm_timer_t t,
                      mcpwm_io_signals_t sl, mcpwm_io_signals_t sr,
@@ -59,15 +72,15 @@ struct MotorMCPWMConfig
 // ---- Callbacks ----
 
 /**
- * @brief User callback for period measurements (microseconds).
+ * @brief User callback for selected-edge interval measurements (microseconds).
  *
  * Called from GPIO interrupt context on Arduino-ESP32; keep it IRAM-safe,
  * short, and non-blocking (no Serial, allocation, delay, or locks).
  *
- * @param period_us Measured period in microseconds between selected edges.
+ * @param interval_us Measured interval in microseconds between selected edges.
  * @param user Opaque pointer supplied during registration.
  */
-using CaptureCallback = void (*)(uint32_t period_us, void *user);
+using CaptureCallback = void (*)(uint32_t interval_us, void *user);
 
 /**
  * @brief Fault event callback (level or latched).
@@ -79,7 +92,35 @@ using CaptureCallback = void (*)(uint32_t period_us, void *user);
  */
 using FaultCallback = void (*)(bool active, void *ctx);
 
+// ---- Setup status ----
+
+/**
+ * @brief Result of the most recent setup attempt.
+ */
+enum class MotorSetupError : uint8_t
+{
+    None,                ///< Setup completed successfully.
+    InvalidPwmPin,       ///< LPWM or RPWM is not a usable output pin.
+    DuplicatePwmPin,     ///< LPWM and RPWM use the same pin.
+    PinConflict,         ///< An optional pin conflicts with another configured pin.
+    InvalidPwmFrequency, ///< Drive PWM frequency is outside the supported range.
+    InvalidInputRange,   ///< Logical PWM input range is invalid.
+    InvalidDitherConfig, ///< Dither timing cannot form a valid period.
+    HardwareInitFailed,  ///< MCPWM setup failed.
+    TimerInitFailed      ///< The soft-brake timer could not be created.
+};
+
 // ---- Optional Modules (software fallbacks) ----
+
+/**
+ * @brief Low-level bridge action applied while a fault is active or latched.
+ */
+enum class FaultAction : uint8_t
+{
+    Coast,          ///< Remove PWM drive and deassert EN when available.
+    DisableOutputs, ///< Deassert EN when available and stop MCPWM output generation.
+    HardBrake       ///< Dynamic brake with EN asserted and A/B at 100%.
+};
 
 /**
  * @brief Optional safety (fault) configuration.
@@ -91,6 +132,23 @@ struct MotorSafetyConfig
     int fault_gpio = -1;           ///< Fault input pin; -1 to disable.
     bool fault_active_high = true; ///< Fault level sense (true = active high).
     bool oneshot = true;           ///< Latch until clearFault() if true; otherwise follow level.
+    FaultAction fault_action = FaultAction::HardBrake; ///< Fault response; hard brake preserves legacy behavior.
+
+    /**
+     * @brief Construct the default safety configuration with fault input disabled.
+     */
+    constexpr MotorSafetyConfig() = default;
+
+    /**
+     * @brief Construct a software fault-input configuration.
+     * @param gpio Fault input GPIO, or -1 to disable fault monitoring.
+     * @param active_high True when a high input level asserts the fault.
+     * @param one_shot True to latch the fault until clearFault() succeeds.
+     * @param action Low-level bridge action to apply while faulted.
+     */
+    constexpr MotorSafetyConfig(int gpio, bool active_high, bool one_shot,
+                                FaultAction action = FaultAction::HardBrake)
+        : fault_gpio(gpio), fault_active_high(active_high), oneshot(one_shot), fault_action(action) {}
 };
 
 /**
@@ -100,13 +158,15 @@ enum class CaptureEdge : uint8_t
 {
     Rising,  ///< Capture on rising edges.
     Falling, ///< Capture on falling edges.
-    Both     ///< Capture on both edges.
+    Both     ///< Capture adjacent-edge intervals; often a half-cycle for a square wave.
 };
 
 /**
- * @brief Optional capture configuration (period measurement).
+ * @brief Optional capture configuration (selected-edge interval measurement).
  *
- * If @p cap_gpio >= 0, an ISR measures period via micros() on the selected edge.
+ * If @p cap_gpio >= 0, an ISR measures the interval between selected edges.
+ * With @ref CaptureEdge::Both, a symmetrical square wave usually reports half
+ * of its full period.
  * The optional callback also runs in that ISR context and must be IRAM-safe,
  * short, and non-blocking.
  */
@@ -114,7 +174,7 @@ struct MotorCaptureConfig
 {
     int cap_gpio = -1;                      ///< Capture input pin; -1 to disable.
     CaptureEdge edge = CaptureEdge::Rising; ///< Capture edge selection.
-    CaptureCallback on_capture = nullptr;   ///< Optional period callback.
+    CaptureCallback on_capture = nullptr;   ///< Optional edge-interval callback.
     void *user = nullptr;                   ///< Opaque user pointer passed to callback.
 };
 
@@ -125,8 +185,8 @@ struct MotorCaptureConfig
  */
 enum class FreewheelMode : uint8_t
 {
-    HiZ,        ///< Coast with outputs Hi-Z; driver may sleep.
-    HiZ_Awake,  ///< Coast with outputs Hi-Z; driver stays awake.
+    HiZ,        ///< Coast with EN low when library EN control is configured.
+    HiZ_Awake,  ///< Enabled A/B=0 state; physical coast/brake is module-dependent.
     DitherBrake ///< Pulsed brake/coast for light drag.
 };
 
@@ -136,16 +196,28 @@ enum class FreewheelMode : uint8_t
 struct MotorBehaviorConfig
 {
     FreewheelMode freewheel_mode = FreewheelMode::HiZ; ///< Default freewheel strategy.
-    int soft_brake_hz = 300;                           ///< Dither frequency for soft-brake.
-    uint16_t dither_pwm = 30;                          ///< Tiny duty used in DitherBrake mode.
-    uint16_t default_soft_brake_pwm = 50;              ///< Soft-brake duty when speed goes to zero.
-    uint16_t min_phase_us = 1500;                      ///< Minimum brake/coast phase (µs). Lower for gentler dither at higher Hz.
+    int soft_brake_hz = 300;                           ///< Dither frequency in Hz (valid range 1..10000).
+    uint16_t dither_pwm = 30;                          ///< Strength used by DitherBrake freewheel mode.
+    uint16_t default_soft_brake_pwm = 50;              ///< Initial soft-brake strength used by setSpeed(0, ...).
+    uint16_t min_phase_us = 50;                        ///< Practical minimum brake/coast phase (µs); reduced if two phases cannot fit.
     bool dither_coast_hi_z = false;                    ///< If true, DitherBrake "coast" uses Hi-Z (EN LOW) instead of 0/0.
 
+    /**
+     * @brief Construct the default motor behavior configuration.
+     */
     constexpr MotorBehaviorConfig() = default;
 
+    /**
+     * @brief Construct a motor behavior configuration.
+     * @param mode Freewheel strategy.
+     * @param hz Soft-brake dither frequency in hertz.
+     * @param dither Dither strength used by DitherBrake freewheel mode.
+     * @param def_soft Initial soft-brake strength used by setSpeed(0, ...).
+     * @param min_phase Minimum requested brake/coast phase in microseconds.
+     * @param dither_hi_z True to deassert EN during dither coast phases.
+     */
     constexpr MotorBehaviorConfig(FreewheelMode mode, int hz, uint16_t dither, uint16_t def_soft = 50,
-                                  uint16_t min_phase = 1500, bool dither_hi_z = false)
+                                  uint16_t min_phase = 50, bool dither_hi_z = false)
         : freewheel_mode(mode), soft_brake_hz(hz), dither_pwm(dither), default_soft_brake_pwm(def_soft),
           min_phase_us(min_phase), dither_coast_hi_z(dither_hi_z) {}
 };
@@ -174,6 +246,8 @@ public:
 
     /**
      * @brief Initialize the driver with hardware configuration.
+     *
+     * Implementations with setup status should leave outputs inactive on failure.
      * @param hw Hardware configuration for MCPWM and pins.
      */
     virtual void setup(const MotorMCPWMConfig &hw) = 0;
@@ -198,6 +272,22 @@ public:
         (void)sfty;
         (void)cap;
         setup(hw, beh);
+    }
+
+    /**
+     * @brief Check whether the most recent setup completed successfully.
+     * @return true If hardware resources are ready for motor commands.
+     * @return false Otherwise.
+     */
+    [[nodiscard]] virtual bool isSetupComplete() const noexcept { return false; }
+
+    /**
+     * @brief Get the result of the most recent setup attempt.
+     * @return MotorSetupError Setup result.
+     */
+    [[nodiscard]] virtual MotorSetupError getLastSetupError() const noexcept
+    {
+        return MotorSetupError::None;
     }
 
     /**
@@ -231,6 +321,13 @@ public:
     virtual void setSoftBrakePWM(uint16_t pwm) noexcept {}
 
     /**
+     * @brief Process deferred safety work in normal task context.
+     *
+     * Call this regularly when a configured fault input requires it.
+     */
+    virtual void pollFaults() noexcept {}
+
+    /**
      * @brief Get the maximum accepted logical PWM input.
      * @return int Maximum input value (e.g., 1023).
      */
@@ -253,12 +350,12 @@ public:
     }
 
     /**
-     * @brief Start the MCPWM outputs (0% duty).
+     * @brief Start MCPWM and reapply the configured freewheel state.
      */
     virtual void start() noexcept {}
 
     /**
-     * @brief Stop the MCPWM outputs.
+     * @brief Deassert EN, set A/B to 0%, and stop the MCPWM outputs.
      */
     virtual void stop() noexcept {}
 
@@ -271,14 +368,27 @@ public:
     virtual bool reconfigureFrequency(int new_hz) noexcept { return false; }
 
     /**
-     * @brief Check if a fault has been latched.
-     * @return true If a fault is active or latched.
+     * @brief Get the latest measured interval between selected capture edges.
+     * @return uint32_t Edge interval in microseconds, or zero before a valid measurement.
+     */
+    [[nodiscard]] virtual uint32_t getLastCapturePeriodUs() const noexcept { return 0; }
+
+    /**
+     * @brief Check whether a one-shot fault is latched or a followed level is active.
+     * @return true If fault output inhibition is active.
      * @return false Otherwise.
      */
     virtual bool hasFault() const noexcept { return false; }
 
     /**
-     * @brief Clear a latched fault and return to a safe idle state.
+     * @brief Check whether a bridge EN pin is configured for library control.
+     * @return true If the configured EN pin can be commanded by the library.
+     * @return false If no EN pin is configured.
+     */
+    [[nodiscard]] virtual bool hasEnableControl() const noexcept { return false; }
+
+    /**
+     * @brief Clear an inactive latched fault and return to zero-output idle.
      */
     virtual void clearFault() noexcept {}
 

@@ -1,11 +1,22 @@
 {
   "name": "ESP32_MCPWM",
-  "version": "1.2.0",
-  "description": "ESP32 dual H-bridge motor driver with MCPWM and soft-brake dithering.",
-  "keywords": ["motor", "mcpwm", "h-bridge", "esp32"],
+  "version": "1.3.0",
+  "description": "Practical Arduino-ESP32 MCPWM H-bridge driver with safe coast, hard and dither braking, software fault handling, runtime retuning, and edge capture.",
+  "keywords": [
+    "arduino",
+    "esp32",
+    "esp32-s3",
+    "motor",
+    "mcpwm",
+    "h-bridge",
+    "bts7960",
+    "ibt-2",
+    "braking",
+    "fault"
+  ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/LittleManBuilds/ESP32_MCPWM.git"
+    "url": "https://github.com/littlemanbuilds/ESP32_MCPWM.git"
   },
   "authors": [
     { "name": "Little Man Builds", "email": "littlemanbuilds@gmail.com", "maintainer": true }
@@ -15,9 +26,11 @@
   "platforms": ["espressif32"],
   "build": { "includeDir": "src" },
   "examples": [
-    "examples/01_Basic_Drive/01_Basic_Drive.ino",
-    "examples/02_Braking_Overview/02_Braking_Overview.ino",
-    "examples/03_Advanced_Features/03_Advanced_Features.ino",
-    "examples/04_Two_Motors_Demo/04_Two_Motors_Demo.ino"
+    "examples/01_BasicMotorControl/01_BasicMotorControl.ino",
+    "examples/02_FreewheelAndDitherBrake/02_FreewheelAndDitherBrake.ino",
+    "examples/03_FaultInputSafety/03_FaultInputSafety.ino",
+    "examples/04_RuntimeFrequencyChange/04_RuntimeFrequencyChange.ino",
+    "examples/05_CaptureInput/05_CaptureInput.ino",
+    "examples/06_TwoMotors/06_TwoMotors.ino"
   ]
 }

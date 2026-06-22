@@ -7,4 +7,4 @@
 using Motor = HBridgeMotor;
 
 // Version macro.
-#define ESP32_MCPWM_MOTOR_VERSION "1.2.0"
+#define ESP32_MCPWM_MOTOR_VERSION "1.3.0"

@@ -1,22 +1,16 @@
-# PlatformIO build output
 .pio/
+.vscode/
+build/
+cmake-build-*/
 
-# VS Code local workspace files
-.vscode/*
-!.vscode/extensions.json
-
-# macOS metadata
 .DS_Store
 __MACOSX/
 
-# Local archives / release exports
 *.zip
 *.ZIP
 
-# Compile database / tooling output
 compile_commands.json
 
-# Build artifacts
 *.o
 *.elf
 *.bin
@@ -24,3 +18,6 @@ compile_commands.json
 *.hex
 *.a
 *.d
+*.out
+*.log
+.test-results/

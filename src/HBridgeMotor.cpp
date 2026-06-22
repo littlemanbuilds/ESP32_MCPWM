@@ -27,6 +27,16 @@ HBridgeMotor::~HBridgeMotor() noexcept
     detachFaultInterrupt();
     detachCaptureInterrupt();
     stopSoftBrake();
+    if (setup_done_)
+    {
+        commandOutput(false, 0.0f, 0.0f);
+        if (deadtime_enabled_)
+            (void)mcpwm_deadtime_disable(mcpwm_unit_, mcpwm_timer_);
+        (void)mcpwm_stop(mcpwm_unit_, mcpwm_timer_);
+        setup_done_ = false;
+        mcpwm_initialized_ = false;
+        deadtime_enabled_ = false;
+    }
     if (soft_timer_)
     {
         (void)esp_timer_stop(soft_timer_);
@@ -41,7 +51,7 @@ void HBridgeMotor::setup(const MotorMCPWMConfig &hw)
     MotorBehaviorConfig def{};
     if (hw.en_pin < 0 && def.freewheel_mode == FreewheelMode::HiZ)
     {
-        // Without EN we prefer to keep the driver awake to ensure true Hi-Z is stable.
+        // Without EN, A/B=0 is the only coast-like state the library can command.
         def.freewheel_mode = FreewheelMode::HiZ_Awake;
     }
     setup(hw, def);
@@ -61,6 +71,10 @@ void HBridgeMotor::setup(const MotorMCPWMConfig &hw, const MotorBehaviorConfig &
 {
     prepareForSetup();
 
+    setup_error_ = validateConfig(hw, beh, safety, cap);
+    if (setup_error_ != MotorSetupError::None)
+        return;
+
     // Pin & route mirrors.
     lpwm_pin_ = hw.lpwm_pin;
     rpwm_pin_ = hw.rpwm_pin;
@@ -76,19 +90,30 @@ void HBridgeMotor::setup(const MotorMCPWMConfig &hw, const MotorBehaviorConfig &
     dither_coast_hi_z_ = beh_.dither_coast_hi_z;
     safety_ = safety;
     cap_ = cap;
-    soft_hz_ = boundSoftHz(beh_.soft_brake_hz);
-    pwm_freq_hz_ = (hw.pwm_freq_hz > 0) ? hw.pwm_freq_hz : 20000;
-    input_max_ = (hw.input_max > 0) ? hw.input_max : 1023;
+    soft_hz_ = beh_.soft_brake_hz;
+    pwm_freq_hz_ = hw.pwm_freq_hz;
+    input_max_ = hw.input_max;
     counter_mode_ = hw.counter;
     percent_per_count_ = 100.0f / static_cast<float>(input_max_);
     soft_brake_pwm_ = static_cast<uint16_t>(clamp<int>(beh_.default_soft_brake_pwm, 0, input_max_));
 
     // EN pin usage.
     use_en_ = (en_pin_ >= 0);
+    if (use_en_)
+    {
+        // Hold the bridge inactive while MCPWM and behavior state are initialized.
+        digitalWrite(en_pin_, LOW);
+        pinMode(en_pin_, OUTPUT);
+        en_state_ = false;
+    }
 
     // GPIO routing.
-    ESP_ERROR_CHECK(mcpwm_gpio_init(mcpwm_unit_, mcpwm_sig_l_, lpwm_pin_));
-    ESP_ERROR_CHECK(mcpwm_gpio_init(mcpwm_unit_, mcpwm_sig_r_, rpwm_pin_));
+    if (mcpwm_gpio_init(mcpwm_unit_, mcpwm_sig_l_, lpwm_pin_) != ESP_OK ||
+        mcpwm_gpio_init(mcpwm_unit_, mcpwm_sig_r_, rpwm_pin_) != ESP_OK)
+    {
+        failSetup(MotorSetupError::HardwareInitFailed);
+        return;
+    }
 
     // Timer/channel setup.
     mcpwm_config_t cfg{};
@@ -97,24 +122,31 @@ void HBridgeMotor::setup(const MotorMCPWMConfig &hw, const MotorBehaviorConfig &
     cfg.cmpr_b = 0;
     cfg.counter_mode = counter_mode_;
     cfg.duty_mode = MCPWM_DUTY_MODE_0;
-    ESP_ERROR_CHECK(mcpwm_init(mcpwm_unit_, mcpwm_timer_, &cfg));
+    if (mcpwm_init(mcpwm_unit_, mcpwm_timer_, &cfg) != ESP_OK)
+    {
+        failSetup(MotorSetupError::HardwareInitFailed);
+        return;
+    }
+    mcpwm_initialized_ = true;
 
     // Dead-time (optional).
     if (hw.use_deadtime)
     {
-        ESP_ERROR_CHECK(mcpwm_deadtime_enable(
-            mcpwm_unit_, mcpwm_timer_, hw.deadtime_type, hw.deadtime_red_ns, hw.deadtime_fed_ns));
+        if (mcpwm_deadtime_enable(mcpwm_unit_, mcpwm_timer_, hw.deadtime_type,
+                                  hw.deadtime_red_ns, hw.deadtime_fed_ns) != ESP_OK)
+        {
+            failSetup(MotorSetupError::HardwareInitFailed);
+            return;
+        }
+        deadtime_enabled_ = true;
     }
 
     // Duty mode set once.
-    ESP_ERROR_CHECK(mcpwm_set_duty_type(mcpwm_unit_, mcpwm_timer_, MCPWM_OPR_A, MCPWM_DUTY_MODE_0));
-    ESP_ERROR_CHECK(mcpwm_set_duty_type(mcpwm_unit_, mcpwm_timer_, MCPWM_OPR_B, MCPWM_DUTY_MODE_0));
-
-    // EN pin state.
-    if (use_en_)
+    if (mcpwm_set_duty_type(mcpwm_unit_, mcpwm_timer_, MCPWM_OPR_A, MCPWM_DUTY_MODE_0) != ESP_OK ||
+        mcpwm_set_duty_type(mcpwm_unit_, mcpwm_timer_, MCPWM_OPR_B, MCPWM_DUTY_MODE_0) != ESP_OK)
     {
-        pinMode(en_pin_, OUTPUT);
-        setEnable(true);
+        failSetup(MotorSetupError::HardwareInitFailed);
+        return;
     }
 
     // Soft-brake scheduler.
@@ -126,7 +158,11 @@ void HBridgeMotor::setup(const MotorMCPWMConfig &hw, const MotorBehaviorConfig &
         args.arg = this;
         args.dispatch_method = ESP_TIMER_TASK;
         args.name = "soft_brake";
-        ESP_ERROR_CHECK(esp_timer_create(&args, &soft_timer_));
+        if (esp_timer_create(&args, &soft_timer_) != ESP_OK)
+        {
+            failSetup(MotorSetupError::TimerInitFailed);
+            return;
+        }
     }
 
     // Safety (software fallback).
@@ -135,6 +171,11 @@ void HBridgeMotor::setup(const MotorMCPWMConfig &hw, const MotorBehaviorConfig &
         pinMode(safety_.fault_gpio, safety_.fault_active_high ? INPUT_PULLDOWN : INPUT_PULLUP);
         attachInterruptArg(safety_.fault_gpio, &HBridgeMotor::faultISRThunk, this, CHANGE);
         fault_irq_pin_ = safety_.fault_gpio;
+        if (faultInputActive())
+        {
+            fault_latched_ = true;
+            fault_pending_ = true;
+        }
     }
 
     // Capture (software fallback).
@@ -150,11 +191,25 @@ void HBridgeMotor::setup(const MotorMCPWMConfig &hw, const MotorBehaviorConfig &
     }
 
     setup_done_ = true;
+    setup_error_ = MotorSetupError::None;
+
+    if (fault_latched_)
+    {
+        applyFaultAction();
+    }
+    else
+    {
+        // Enabled 0/0 can brake some bridges, so setup must finish through the configured freewheel path.
+        setFreewheel();
+    }
 }
 
 // Set speed and direction.
 void HBridgeMotor::setSpeed(int speed, Dir dir) noexcept
 {
+    if (!setup_done_ || fault_latched_)
+        return;
+
     const uint16_t v = static_cast<uint16_t>(clamp<int>(speed, 0, input_max_));
     if (v == 0)
     {
@@ -163,19 +218,18 @@ void HBridgeMotor::setSpeed(int speed, Dir dir) noexcept
     }
 
     stopSoftBrake();
-    setEnable(true);
 
     const float duty = static_cast<float>(v) * percent_per_count_;
     if (dir == Dir::CW)
-        writeAB(duty, 0.0f);
+        commandOutput(true, duty, 0.0f);
     else
-        writeAB(0.0f, duty);
+        commandOutput(true, 0.0f, duty);
 }
 
 // Set speed and direction (in percent).
 void HBridgeMotor::setSpeedPercent(float percent, Dir dir) noexcept
 {
-    if (percent < 0.0f)
+    if (!std::isfinite(percent) || percent < 0.0f)
         percent = 0.0f;
     if (percent > 100.0f)
         percent = 100.0f;
@@ -188,28 +242,21 @@ void HBridgeMotor::setSpeedPercent(float percent, Dir dir) noexcept
 // Enter freewheel (coast) according to current FreewheelMode.
 void HBridgeMotor::setFreewheel() noexcept
 {
+    if (!setup_done_ || fault_latched_)
+        return;
+
     stopSoftBrake();
     switch (beh_.freewheel_mode)
     {
     case FreewheelMode::HiZ:
-        setEnable(false);
-        writeAB(0.0f, 0.0f);
+        commandOutput(false, 0.0f, 0.0f);
         break;
     case FreewheelMode::HiZ_Awake:
-        setEnable(true);
-        writeAB(0.0f, 0.0f);
+        commandOutput(true, 0.0f, 0.0f);
         break;
     case FreewheelMode::DitherBrake:
         setSoftBrakePWM(beh_.dither_pwm);
-        if (soft_brake_pwm_ == 0)
-        {
-            setEnable(true);
-            writeAB(0.0f, 0.0f);
-        }
-        else
-        {
-            startSoftBrake();
-        }
+        startSoftBrake();
         break;
     }
 }
@@ -217,25 +264,37 @@ void HBridgeMotor::setFreewheel() noexcept
 // Apply a hard electronic brake (A=100%, B=100%).
 void HBridgeMotor::setHardBrake() noexcept
 {
+    if (!setup_done_ || fault_latched_)
+        return;
+
     stopSoftBrake();
-    setEnable(true);
-    writeAB(100.0f, 100.0f);
+    commandOutput(true, 100.0f, 100.0f);
 }
 
 // Set the soft-brake PWM level (0..getMaxPwmInput()).
 void HBridgeMotor::setSoftBrakePWM(uint16_t pwm) noexcept
 {
     const auto clamped = static_cast<uint16_t>(clamp<int>(pwm, 0, input_max_));
+    lockSoft();
     if (clamped == soft_brake_pwm_)
+    {
+        unlockSoft();
         return; ///< No-op if unchanged.
+    }
     soft_brake_pwm_ = clamped;
-    if (soft_active_)
-        recomputeSoftDurations();
+    const bool was_active = soft_active_;
+    unlockSoft();
+
+    if (was_active)
+        startSoftBrake();
 }
 
 // Convenience to immediately start soft-brake at the given level.
 void HBridgeMotor::softBrakeNow(uint16_t pwm) noexcept
 {
+    if (!setup_done_ || fault_latched_)
+        return;
+
     setSoftBrakePWM(pwm);
     startSoftBrake();
 }
@@ -243,12 +302,12 @@ void HBridgeMotor::softBrakeNow(uint16_t pwm) noexcept
 // Process deferred fault actions and notify callback.
 void HBridgeMotor::pollFaults() noexcept
 {
-    if (!fault_pending_)
+    if (!setup_done_ || !fault_pending_)
         return;
     fault_pending_ = false;
     if (fault_latched_)
     {
-        emergencyBrake(); ///< Hold electronic brake.
+        applyFaultAction();
     }
     else
     {
@@ -261,128 +320,217 @@ void HBridgeMotor::pollFaults() noexcept
 // Start the MCPWM outputs (0% duty).
 void HBridgeMotor::start() noexcept
 {
-    writeAB(0.0f, 0.0f);
-    ESP_ERROR_CHECK(mcpwm_start(mcpwm_unit_, mcpwm_timer_));
+    if (!setup_done_ || fault_latched_)
+        return;
+
+    stopSoftBrake();
+    commandOutput(false, 0.0f, 0.0f);
+    if (mcpwm_start(mcpwm_unit_, mcpwm_timer_) == ESP_OK)
+        setFreewheel();
 }
 
 // Stop the MCPWM outputs.
 void HBridgeMotor::stop() noexcept
 {
-    writeAB(0.0f, 0.0f);
-    ESP_ERROR_CHECK(mcpwm_stop(mcpwm_unit_, mcpwm_timer_));
+    if (!setup_done_ || fault_latched_)
+        return;
+
+    stopSoftBrake();
+    commandOutput(false, 0.0f, 0.0f);
+    (void)mcpwm_stop(mcpwm_unit_, mcpwm_timer_);
 }
 
 // Attempt to change the PWM frequency at runtime.
 bool HBridgeMotor::reconfigureFrequency(int new_hz) noexcept
 {
-    if (new_hz <= 0)
+    if (!setup_done_ || new_hz < kPwmHzMin || new_hz > kPwmHzMax)
         return false;
+
+    lockSoft();
+    const bool restart_dither = soft_active_;
+    unlockSoft();
+
+    if (!fault_latched_)
+    {
+        stopSoftBrake();
+        // Frequency changes begin from a disabled zero-output state.
+        commandOutput(false, 0.0f, 0.0f);
+    }
 
     const esp_err_t err = mcpwm_set_frequency(mcpwm_unit_, mcpwm_timer_, new_hz); // Legacy API path.
     if (err == ESP_OK)
     {
         pwm_freq_hz_ = new_hz;
+        if (restart_dither && !fault_latched_)
+            startSoftBrake();
         return true;
     }
     return false;
 }
 
-// Clear a latched fault and return to a safe idle state.
+// Clear an inactive latched fault and return to zero-output idle.
 void HBridgeMotor::clearFault() noexcept
 {
+    if (!setup_done_)
+        return;
+
     fault_latched_ = false;
+    fault_pending_ = false;
+
+    if (safety_.fault_gpio >= 0 && faultInputActive())
+    {
+        fault_latched_ = true;
+        applyFaultAction();
+        return;
+    }
+
     stopSoftBrake();
-    setEnable(true);
-    writeAB(0.0f, 0.0f);
+    commandOutput(false, 0.0f, 0.0f);
+    (void)mcpwm_start(mcpwm_unit_, mcpwm_timer_);
+
+    // Preserve an assertion posted while the idle state was being applied.
+    if (fault_latched_)
+        applyFaultAction();
 }
 
 // Force raw outputs (100% on the requested sides).
 void HBridgeMotor::forceOutputs(bool a_high, bool b_high) noexcept
 {
-    setEnable(true);
-    writeAB(a_high ? 100.0f : 0.0f, b_high ? 100.0f : 0.0f);
+    if (!setup_done_ || fault_latched_)
+        return;
+
+    stopSoftBrake();
+    commandOutput(true, a_high ? 100.0f : 0.0f, b_high ? 100.0f : 0.0f);
 }
 
 // esp_timer task callback → toggle phase and reschedule.
 void HBridgeMotor::softBrakeTimerTask() noexcept
 {
     lockSoft();
-    if (!soft_active_)
+    if (!setup_done_ || !soft_active_ || fault_latched_)
     {
+        soft_active_ = false;
         unlockSoft();
         return;
     }
     soft_phase_ = (soft_phase_ == BrakePhase::Coast) ? BrakePhase::Brake : BrakePhase::Coast;
     const BrakePhase p = soft_phase_;
+    const uint32_t sequence = soft_sequence_;
     unlockSoft();
 
-    applyPhase(p);
-    scheduleNextPhase();
+    if (applyDitherPhase(p, sequence))
+        (void)scheduleNextPhase(sequence);
 }
 
 // Apply current soft-brake phase.
-void HBridgeMotor::applyPhase(BrakePhase p) noexcept
+void HBridgeMotor::applyPhase(BrakePhase phase) noexcept
 {
-    switch (p)
+    if (!setup_done_ || fault_latched_)
+        return;
+
+    switch (phase)
     {
     case BrakePhase::Brake:
-        setEnable(true);
-        writeAB(100.0f, 100.0f);
+        commandOutput(true, 100.0f, 100.0f);
         break;
     case BrakePhase::Coast:
-        // First ensure duties are zeroed, then optionally Hi-Z the bridge.
-        writeAB(0.0f, 0.0f);
-        if (dither_coast_hi_z_)
-        {
-            setEnable(false); ///< True coast on modules where 0/0 is also brake (IBT-2/BTS7960).
-        }
+        // A zero dither level is ordinary coast, not an enabled zero-PWM brake state.
+        commandOutput(!dither_coast_hi_z_, 0.0f, 0.0f);
         break;
     }
 }
 
-// Schedule next dither phase tick.
-void HBridgeMotor::scheduleNextPhase() noexcept
+// Apply a dither phase only while its sequence is still current.
+bool HBridgeMotor::applyDitherPhase(BrakePhase phase, uint32_t sequence) noexcept
 {
+    const bool enable = (phase == BrakePhase::Brake) || !dither_coast_hi_z_;
+    const float duty = (phase == BrakePhase::Brake) ? 100.0f : 0.0f;
+
     lockSoft();
-    if (!soft_active_)
+    if (!setup_done_ || !soft_active_ || fault_latched_ || soft_sequence_ != sequence)
     {
         unlockSoft();
-        return;
+        return false;
     }
-    const int64_t use_us = (soft_phase_ == BrakePhase::Brake) ? soft_us_brake_ : soft_us_coast_;
+    commanded_enable_ = enable;
+    commanded_a_percent_ = duty;
+    commanded_b_percent_ = duty;
+    const uint32_t output_sequence = ++output_sequence_;
     unlockSoft();
 
-    (void)esp_timer_stop(soft_timer_);
-    ESP_ERROR_CHECK(esp_timer_start_once(soft_timer_, use_us));
+    writeOutputUntilCurrent(output_sequence, enable, duty, duty);
+
+    lockSoft();
+    const bool current = setup_done_ && soft_active_ && !fault_latched_ &&
+                         soft_sequence_ == sequence;
+    unlockSoft();
+    return current;
+}
+
+// Schedule next dither phase tick.
+bool HBridgeMotor::scheduleNextPhase(uint32_t sequence) noexcept
+{
+    lockSoft();
+    if (!soft_active_ || fault_latched_)
+    {
+        soft_active_ = false;
+        unlockSoft();
+        return false;
+    }
+    if (soft_sequence_ != sequence)
+    {
+        unlockSoft();
+        return false;
+    }
+    const int64_t use_us = (soft_phase_ == BrakePhase::Brake) ? soft_us_brake_ : soft_us_coast_;
+    commanded_timer_active_ = true;
+    commanded_timer_us_ = use_us;
+    const uint32_t timer_sequence = ++timer_sequence_;
+    unlockSoft();
+
+    if (!writeTimerUntilCurrent(timer_sequence, true, use_us))
+    {
+        stopSoftBrake();
+        applyPhase(BrakePhase::Coast);
+        return false;
+    }
+    return true;
 }
 
 // Begin soft-brake dither.
 void HBridgeMotor::startSoftBrake() noexcept
 {
-    recomputeSoftDurations();
+    if (!setup_done_ || fault_latched_)
+        return;
+
+    stopSoftBrake();
+    if (!recomputeSoftDurations())
+    {
+        applyPhase(BrakePhase::Coast);
+        return;
+    }
 
     lockSoft();
-    const float lvl = soft_level_;
-    const bool pure_coast = (lvl <= 0.001f) || (soft_us_brake_ == 0);
-    const bool pure_brake = (lvl >= 0.999f) || (soft_us_coast_ == 0);
+    const bool pure_coast = (soft_us_brake_ == 0);
+    const bool pure_brake = (soft_us_coast_ == 0);
 
     if (pure_coast || pure_brake)
     {
         soft_active_ = false;
+        ++soft_sequence_;
         unlockSoft();
 
-        setEnable(true);
-        writeAB(pure_coast ? 0.0f : 100.0f, pure_coast ? 0.0f : 100.0f);
+        applyPhase(pure_coast ? BrakePhase::Coast : BrakePhase::Brake);
         return;
     }
 
     soft_phase_ = BrakePhase::Coast;
     soft_active_ = true;
+    const uint32_t sequence = ++soft_sequence_;
     unlockSoft();
 
-    applyPhase(BrakePhase::Coast);
-    (void)esp_timer_stop(soft_timer_);
-    scheduleNextPhase();
+    if (applyDitherPhase(BrakePhase::Coast, sequence))
+        (void)scheduleNextPhase(sequence);
 }
 
 // Stop soft-brake dither.
@@ -390,26 +538,22 @@ void HBridgeMotor::stopSoftBrake() noexcept
 {
     lockSoft();
     soft_active_ = false;
+    ++soft_sequence_;
+    commanded_timer_active_ = false;
+    commanded_timer_us_ = 0;
+    const uint32_t timer_sequence = ++timer_sequence_;
     unlockSoft();
 
-    if (soft_timer_)
-        (void)esp_timer_stop(soft_timer_);
-}
-
-// Bound soft-brake frequency.
-int HBridgeMotor::boundSoftHz(int hz) noexcept
-{
-    return (hz < kSoftHzMin) ? kSoftHzMin : (hz > kSoftHzMax) ? kSoftHzMax
-                                                              : hz;
+    (void)writeTimerUntilCurrent(timer_sequence, false, 0);
 }
 
 // Control optional EN pin.
-void HBridgeMotor::setEnable(bool on) noexcept
+void HBridgeMotor::setEnable(bool enabled) noexcept
 {
-    if (use_en_ && en_state_ != on)
+    if (use_en_ && en_state_ != enabled)
     {
-        digitalWrite(en_pin_, on ? HIGH : LOW);
-        en_state_ = on;
+        digitalWrite(en_pin_, enabled ? HIGH : LOW);
+        en_state_ = enabled;
     }
 }
 
@@ -424,46 +568,136 @@ void HBridgeMotor::writeAB(float a_percent, float b_percent) noexcept
 
     if (!sameA)
     {
-        mcpwm_set_duty(mcpwm_unit_, mcpwm_timer_, MCPWM_OPR_A, a_percent);
-        last_a_percent_ = a_percent;
+        if (mcpwm_set_duty(mcpwm_unit_, mcpwm_timer_, MCPWM_OPR_A, a_percent) == ESP_OK)
+            last_a_percent_ = a_percent;
     }
     if (!sameB)
     {
-        mcpwm_set_duty(mcpwm_unit_, mcpwm_timer_, MCPWM_OPR_B, b_percent);
-        last_b_percent_ = b_percent;
+        if (mcpwm_set_duty(mcpwm_unit_, mcpwm_timer_, MCPWM_OPR_B, b_percent) == ESP_OK)
+            last_b_percent_ = b_percent;
+    }
+}
+
+// Apply one output snapshot in an order that avoids an enabled transition window.
+void HBridgeMotor::writeHardwareOutput(bool enable, float a_percent, float b_percent) noexcept
+{
+    const bool both_channels_change =
+        std::fabs(a_percent - last_a_percent_) > kDutyEps &&
+        std::fabs(b_percent - last_b_percent_) > kDutyEps;
+    if (!enable || (use_en_ && en_state_ && both_channels_change))
+    {
+        // Avoid a one-sided drive pulse while two MCPWM channels are updated in sequence.
+        setEnable(false);
+    }
+    writeAB(a_percent, b_percent);
+    if (enable)
+        setEnable(true);
+}
+
+// Keep applying the newest published output if a callback loses a command race.
+void HBridgeMotor::writeOutputUntilCurrent(uint32_t sequence, bool enable,
+                                           float a_percent, float b_percent) noexcept
+{
+    for (;;)
+    {
+        writeHardwareOutput(enable, a_percent, b_percent);
+
+        lockSoft();
+        if (sequence == output_sequence_)
+        {
+            unlockSoft();
+            return;
+        }
+        sequence = output_sequence_;
+        enable = commanded_enable_;
+        a_percent = commanded_a_percent_;
+        b_percent = commanded_b_percent_;
+        unlockSoft();
+    }
+}
+
+// Publish a normal task-context output command before touching hardware.
+void HBridgeMotor::commandOutput(bool enable, float a_percent, float b_percent) noexcept
+{
+    lockSoft();
+    commanded_enable_ = enable;
+    commanded_a_percent_ = a_percent;
+    commanded_b_percent_ = b_percent;
+    const uint32_t sequence = ++output_sequence_;
+    unlockSoft();
+
+    writeOutputUntilCurrent(sequence, enable, a_percent, b_percent);
+}
+
+// Keep the shared one-shot timer aligned with the latest start/stop command.
+bool HBridgeMotor::writeTimerUntilCurrent(uint32_t sequence, bool active,
+                                          int64_t timeout_us) noexcept
+{
+    for (;;)
+    {
+        if (soft_timer_)
+            (void)esp_timer_stop(soft_timer_);
+
+        bool start_succeeded = true;
+        if (active)
+        {
+            start_succeeded = soft_timer_ && timeout_us > 0 &&
+                              esp_timer_start_once(soft_timer_, timeout_us) == ESP_OK;
+        }
+
+        lockSoft();
+        if (sequence == timer_sequence_)
+        {
+            if (!start_succeeded)
+            {
+                commanded_timer_active_ = false;
+                commanded_timer_us_ = 0;
+                ++timer_sequence_;
+                soft_active_ = false;
+                ++soft_sequence_;
+            }
+            unlockSoft();
+            return start_succeeded;
+        }
+        sequence = timer_sequence_;
+        active = commanded_timer_active_;
+        timeout_us = commanded_timer_us_;
+        unlockSoft();
     }
 }
 
 // Recompute dither phase durations.
-void HBridgeMotor::recomputeSoftDurations() noexcept
+bool HBridgeMotor::recomputeSoftDurations() noexcept
 {
-    const float lvl = clamp<float>(
-        static_cast<float>(soft_brake_pwm_) / static_cast<float>(input_max_), 0.0f, 1.0f);
-    const int hz = (soft_hz_ <= 0) ? kSoftHzMin : soft_hz_; ///< Last-ditch guard.
+    if (input_max_ <= 0 || soft_hz_ <= 0)
+        return false;
 
-    // Period in microseconds (integer for esp_timer).
-    const double period_us_f = kMicrosPerSec / static_cast<double>(hz);
-    const int64_t period_us = static_cast<int64_t>(period_us_f + 0.5);
+    const int64_t period_us = static_cast<int64_t>(kMicrosPerSec / static_cast<uint32_t>(soft_hz_));
+    if (period_us < 2)
+        return false;
 
-    // Compute requested phase split (before enforcing minimums).
-    int64_t br = static_cast<int64_t>(period_us_f * static_cast<double>(lvl) + 0.5); ///< Brake phase.
-    int64_t co = period_us - br;                                                     ///< Coast phase.
-
-    // Cap the per-phase minimum to half the period so two minimums always fit.
-    const int64_t half_period = period_us / 2;
-    const int64_t min_us_cap = (min_phase_us_ > half_period) ? half_period : static_cast<int64_t>(min_phase_us_);
-
-    // Enforce minimums when a phase is nonzero (keeps duty meaningful at high Hz).
-    if (br > 0 && br < min_us_cap)
-        br = min_us_cap;
-    if (co > 0 && co < min_us_cap)
-        co = min_us_cap;
+    const uint32_t pwm = clamp<uint32_t>(soft_brake_pwm_, 0U, static_cast<uint32_t>(input_max_));
+    int64_t br = 0;
+    if (pwm >= static_cast<uint32_t>(input_max_))
+    {
+        br = period_us;
+    }
+    else if (pwm > 0)
+    {
+        br = static_cast<int64_t>((static_cast<uint64_t>(period_us) * pwm +
+                                   static_cast<uint32_t>(input_max_ / 2)) /
+                                  static_cast<uint32_t>(input_max_));
+        const int64_t min_us = clamp<int64_t>(static_cast<int64_t>(min_phase_us_),
+                                              1, period_us / 2);
+        br = clamp<int64_t>(br, min_us, period_us - min_us);
+    }
+    const int64_t co = period_us - br;
 
     lockSoft();
-    soft_level_ = lvl;
     soft_us_brake_ = br;
     soft_us_coast_ = co;
     unlockSoft();
+    return true;
 }
 
 // Static thunk to instance ISR.
@@ -472,8 +706,7 @@ void IRAM_ATTR HBridgeMotor::faultISRThunk(void *arg) { static_cast<HBridgeMotor
 // Fault ISR.
 void IRAM_ATTR HBridgeMotor::faultISR() noexcept
 {
-    const int level = gpio_get_level(static_cast<gpio_num_t>(safety_.fault_gpio));
-    const bool active = safety_.fault_active_high ? (level != 0) : (level == 0);
+    const bool active = faultInputActive();
 
     if (safety_.oneshot)
     {
@@ -491,12 +724,37 @@ void IRAM_ATTR HBridgeMotor::faultISR() noexcept
     }
 }
 
-// Immediate full electronic brake.
-void HBridgeMotor::emergencyBrake() noexcept
+// Read the configured fault level.
+bool IRAM_ATTR HBridgeMotor::faultInputActive() const noexcept
+{
+    const int level = gpio_get_level(static_cast<gpio_num_t>(safety_.fault_gpio));
+    return safety_.fault_active_high ? (level != 0) : (level == 0);
+}
+
+// Apply the configured low-level fault action.
+void HBridgeMotor::applyFaultAction() noexcept
 {
     stopSoftBrake();
-    setEnable(true);
-    writeAB(100.0f, 100.0f);
+
+    switch (safety_.fault_action)
+    {
+    case FaultAction::Coast:
+        commandOutput(false, 0.0f, 0.0f);
+        break;
+    case FaultAction::DisableOutputs:
+        commandOutput(false, 0.0f, 0.0f);
+        (void)mcpwm_stop(mcpwm_unit_, mcpwm_timer_);
+        break;
+    case FaultAction::HardBrake:
+        emergencyBrake();
+        break;
+    }
+}
+
+// Apply the full electronic brake.
+void HBridgeMotor::emergencyBrake() noexcept
+{
+    commandOutput(true, 100.0f, 100.0f);
     // Keep MCPWM running so the bridge continues to hold the electronic brake.
     (void)mcpwm_start(mcpwm_unit_, mcpwm_timer_);
 }
@@ -519,9 +777,11 @@ void IRAM_ATTR HBridgeMotor::capISR() noexcept
 {
     const uint32_t now = micros();
     const uint32_t last = last_edge_us_;
+    const bool had_edge = capture_edge_seen_;
     last_edge_us_ = now;
+    capture_edge_seen_ = true;
 
-    if (last != 0)
+    if (had_edge)
     {
         // Wrap-safe delta (uint32_t micros()).
         period_us_ = (now >= last) ? (now - last) : (now + (0xFFFFFFFFu - last) + 1u);
@@ -551,8 +811,9 @@ void HBridgeMotor::prepareForSetup() noexcept
 
     if (setup_done_)
     {
-        setEnable(false);
-        writeAB(0.0f, 0.0f);
+        commandOutput(false, 0.0f, 0.0f);
+        if (deadtime_enabled_)
+            (void)mcpwm_deadtime_disable(mcpwm_unit_, mcpwm_timer_);
         (void)mcpwm_stop(mcpwm_unit_, mcpwm_timer_);
     }
 
@@ -560,23 +821,98 @@ void HBridgeMotor::prepareForSetup() noexcept
     fault_pending_ = false;
     last_edge_us_ = 0;
     period_us_ = 0;
+    capture_edge_seen_ = false;
     last_a_percent_ = -1.0f;
     last_b_percent_ = -1.0f;
     setup_done_ = false;
+    mcpwm_initialized_ = false;
+    deadtime_enabled_ = false;
+    use_en_ = false;
+    en_state_ = false;
+    setup_error_ = MotorSetupError::None;
+}
+
+// Check user configuration before MCPWM or interrupt setup begins.
+MotorSetupError HBridgeMotor::validateConfig(const MotorMCPWMConfig &hw,
+                                             const MotorBehaviorConfig &beh,
+                                             const MotorSafetyConfig &safety,
+                                             const MotorCaptureConfig &cap) const noexcept
+{
+    if (!GPIO_IS_VALID_OUTPUT_GPIO(hw.lpwm_pin) || !GPIO_IS_VALID_OUTPUT_GPIO(hw.rpwm_pin))
+        return MotorSetupError::InvalidPwmPin;
+    if (hw.lpwm_pin == hw.rpwm_pin)
+        return MotorSetupError::DuplicatePwmPin;
+    if (hw.en_pin >= 0 && (!GPIO_IS_VALID_OUTPUT_GPIO(hw.en_pin) ||
+                           hw.en_pin == hw.lpwm_pin || hw.en_pin == hw.rpwm_pin))
+        return MotorSetupError::PinConflict;
+    if (hw.sig_l == hw.sig_r)
+        return MotorSetupError::PinConflict;
+    if (hw.pwm_freq_hz < kPwmHzMin || hw.pwm_freq_hz > kPwmHzMax)
+        return MotorSetupError::InvalidPwmFrequency;
+    if (hw.input_max <= 0 || hw.input_max > UINT16_MAX)
+        return MotorSetupError::InvalidInputRange;
+    if (beh.soft_brake_hz <= 0 || beh.soft_brake_hz > kSoftHzMax ||
+        (kMicrosPerSec / static_cast<uint32_t>(beh.soft_brake_hz)) < 2U)
+        return MotorSetupError::InvalidDitherConfig;
+
+    if (safety.fault_gpio >= 0)
+    {
+        if (!GPIO_IS_VALID_GPIO(safety.fault_gpio) || safety.fault_gpio == hw.lpwm_pin ||
+            safety.fault_gpio == hw.rpwm_pin || safety.fault_gpio == hw.en_pin)
+            return MotorSetupError::PinConflict;
+    }
+
+    if (cap.cap_gpio >= 0)
+    {
+        if (!GPIO_IS_VALID_GPIO(cap.cap_gpio) || cap.cap_gpio == hw.lpwm_pin ||
+            cap.cap_gpio == hw.rpwm_pin || cap.cap_gpio == hw.en_pin ||
+            cap.cap_gpio == safety.fault_gpio)
+            return MotorSetupError::PinConflict;
+    }
+
+    return MotorSetupError::None;
+}
+
+// Leave a failed setup inactive without aborting the application.
+void HBridgeMotor::failSetup(MotorSetupError error) noexcept
+{
+    detachFaultInterrupt();
+    detachCaptureInterrupt();
+    stopSoftBrake();
+    if (use_en_)
+        setEnable(false);
+    if (mcpwm_initialized_)
+    {
+        commandOutput(false, 0.0f, 0.0f);
+        if (deadtime_enabled_)
+            (void)mcpwm_deadtime_disable(mcpwm_unit_, mcpwm_timer_);
+        (void)mcpwm_stop(mcpwm_unit_, mcpwm_timer_);
+    }
+    setup_done_ = false;
+    mcpwm_initialized_ = false;
+    deadtime_enabled_ = false;
+    use_en_ = false;
+    setup_error_ = error;
 }
 
 // Set the freewheel mode for subsequent setFreewheel() calls.
 void HBridgeMotor::setFreewheelMode(FreewheelMode m) noexcept
 {
     lockSoft();
-    const bool change = (beh_.freewheel_mode != m);
+    if (beh_.freewheel_mode == m)
+    {
+        unlockSoft();
+        return;
+    }
     beh_.freewheel_mode = m;
     const bool was_active = soft_active_;
-    soft_active_ = false;
     unlockSoft();
 
-    if (change && was_active && soft_timer_)
-        (void)esp_timer_stop(soft_timer_);
+    if (was_active)
+    {
+        stopSoftBrake();
+        applyPhase(BrakePhase::Coast);
+    }
 }
 
 // Set the freewheel mode and immediately apply freewheel.
