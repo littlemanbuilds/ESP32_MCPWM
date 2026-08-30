@@ -1,27 +1,37 @@
 /**
- * @file 03_FaultInputSafety.ino
+ * MIT License
  *
- * @brief Use an active-low fault input to latch a safe coast command.
+ * @brief Use a software-observed active-low fault to latch a coast command.
+ *
+ * @file 03_FaultInputSafety.ino
+ * @author Little Man Builds (Darren Osborne)
+ * @date 2026-06-22
+ * @copyright Copyright (c) 2026 Little Man Builds
  *
  * Wiring (ESP32-S3 DevKitC-1):
  * GPIO 4 -> LPWM, GPIO 5 -> RPWM, GPIO 6 -> EN, and common GND.
- * GPIO 7 is the active-low fault input. For a low-current bench test, connect
- * GPIO 7 to GND with a pushbutton. Do not use a motor power wire for this test.
+ * GPIO 7 is the active-low software fault observer. For a low-current bench
+ * test, connect GPIO 7 to GND with a pushbutton. This path requires pollFaults()
+ * and is not a hardware emergency stop. Do not use a motor power wire here.
  */
 
 #include <ESP32_MCPWM.h>
 
-static constexpr int LPWM_PIN = 4;
-static constexpr int RPWM_PIN = 5;
-static constexpr int EN_PIN = 6;
-static constexpr int FAULT_PIN = 7;
+// ---- Hardware and fault configuration ---- //
 
-MotorMCPWMConfig hardware{LPWM_PIN, RPWM_PIN, EN_PIN,
-                          MCPWM_UNIT_0, MCPWM_TIMER_0, MCPWM0A, MCPWM0B};
+const int LPWM_PIN = 4;
+const int RPWM_PIN = 5;
+const int EN_PIN = 6;
+const int FAULT_PIN = 7;
+
+MotorMCPWMConfig hardware{LPWM_PIN, RPWM_PIN, EN_PIN, MCPWM_UNIT_0, MCPWM_TIMER_0, MCPWM0A, MCPWM0B};
+// This is a software observer configuration, not a hardware emergency stop.
 MotorSafetyConfig safety;
 Motor motor;
 bool fault_reported = false;
 bool drive_armed = true;
+
+// ---- Setup ---- //
 
 void setup()
 {
@@ -32,8 +42,8 @@ void setup()
     safety.oneshot = true;
     safety.fault_action = FaultAction::Coast;
 
-    motor.setup(hardware, MotorBehaviorConfig{}, safety, MotorCaptureConfig{});
-    if (!motor.isSetupComplete())
+    const MotorSetupResult setup_result = motor.setup(hardware, MotorBehaviorConfig{}, safety, MotorCaptureConfig{});
+    if (!setup_result.ok())
     {
         Serial.println("Motor setup failed. Check the configured pins.");
         while (true)
@@ -44,12 +54,15 @@ void setup()
     if (!motor.hasFault())
     {
         Serial.println("Motor running at 30%. Ground GPIO 7 to assert the fault.");
-        motor.setSpeedPercent(30, Dir::CW);
+        motor.drivePercent(30, Dir::CW);
     }
 }
 
+// ---- Main loop ---- //
+
 void loop()
 {
+    // The GPIO ISR only records fault state; polling owns the bridge action.
     motor.pollFaults();
 
     if (motor.hasFault())
@@ -70,7 +83,7 @@ void loop()
     }
     else if (!drive_armed && Serial.available() && Serial.read() == 'd')
     {
-        motor.setSpeedPercent(30, Dir::CW);
+        motor.drivePercent(30, Dir::CW);
         drive_armed = true;
         fault_reported = false;
         Serial.println("New drive command accepted.");

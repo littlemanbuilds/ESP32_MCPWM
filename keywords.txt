@@ -1,73 +1,68 @@
 #######################################
-# Types / Classes
+# Datatypes (KEYWORD1)
 #######################################
+Motor	KEYWORD1
 HBridgeMotor	KEYWORD1
 IMotorDriver	KEYWORD1
 MotorMCPWMConfig	KEYWORD1
 MotorBehaviorConfig	KEYWORD1
 MotorSafetyConfig	KEYWORD1
+MotorHardwareFaultConfig	KEYWORD1
 MotorCaptureConfig	KEYWORD1
-MotorSetupError	KEYWORD1
-FaultAction	KEYWORD1
-CaptureEdge	KEYWORD1
+MotorSetupResult	KEYWORD1
+MotorOperationResult	KEYWORD1
+MotorDriverStatus	KEYWORD1
+MotorHardwareReadback	KEYWORD1
 Dir	KEYWORD1
 FreewheelMode	KEYWORD1
-FaultCallback	KEYWORD1
-CaptureCallback	KEYWORD1
-Motor	KEYWORD1
+FaultAction	KEYWORD1
+HardwareFaultMode	KEYWORD1
+HardwareFaultInput	KEYWORD1
+HardwareFaultOutputAction	KEYWORD1
+MotorOutputMode	KEYWORD1
+MotorOperation	KEYWORD1
+MotorSetupError	KEYWORD1
+MotorOperationError	KEYWORD1
+CaptureEdge	KEYWORD1
 
 #######################################
-# Methods / Functions
+# Methods (KEYWORD2)
 #######################################
 setup	KEYWORD2
 isSetupComplete	KEYWORD2
 getLastSetupError	KEYWORD2
+drive	KEYWORD2
+drivePercent	KEYWORD2
 setSpeed	KEYWORD2
 setSpeedPercent	KEYWORD2
+coast	KEYWORD2
+disableOutputs	KEYWORD2
 setFreewheel	KEYWORD2
-setHardBrake	KEYWORD2
-setSoftBrakePWM	KEYWORD2
-softBrakeNow	KEYWORD2
 setFreewheelMode	KEYWORD2
 applyFreewheel	KEYWORD2
+setHardBrake	KEYWORD2
+softBrakeNow	KEYWORD2
+setSoftBrakePWM	KEYWORD2
+pollFaults	KEYWORD2
+hasFault	KEYWORD2
+clearFault	KEYWORD2
+setFaultCallback	KEYWORD2
 start	KEYWORD2
 stop	KEYWORD2
 reconfigureFrequency	KEYWORD2
-hasFault	KEYWORD2
-hasEnableControl	KEYWORD2
-clearFault	KEYWORD2
-pollFaults	KEYWORD2
-setFaultCallback	KEYWORD2
+status	KEYWORD2
+readback	KEYWORD2
 forceOutputs	KEYWORD2
-getMaxPwmInput	KEYWORD2
 getLastCapturePeriodUs	KEYWORD2
-changeDir	KEYWORD2
+getMaxPwmInput	KEYWORD2
+hasEnableControl	KEYWORD2
 
 #######################################
-# Constants / Macros
+# Constants (LITERAL1)
 #######################################
+ESP32_MCPWM_VERSION	LITERAL1
+ESP32_MCPWM_VERSION_MAJOR	LITERAL1
+ESP32_MCPWM_VERSION_MINOR	LITERAL1
+ESP32_MCPWM_VERSION_PATCH	LITERAL1
 ESP32_MCPWM_MOTOR_VERSION	LITERAL1
-
-#######################################
-# Scoped Enum Literals
-#######################################
-CW	LITERAL1
-CCW	LITERAL1
-HiZ	LITERAL1
-HiZ_Awake	LITERAL1
-DitherBrake	LITERAL1
-Coast	LITERAL1
-DisableOutputs	LITERAL1
-HardBrake	LITERAL1
-None	LITERAL1
-InvalidPwmPin	LITERAL1
-DuplicatePwmPin	LITERAL1
-PinConflict	LITERAL1
-InvalidPwmFrequency	LITERAL1
-InvalidInputRange	LITERAL1
-InvalidDitherConfig	LITERAL1
-HardwareInitFailed	LITERAL1
-TimerInitFailed	LITERAL1
-Rising	LITERAL1
-Falling	LITERAL1
-Both	LITERAL1
+ESP32_MCPWM_ENABLE_COMMISSIONING_API	LITERAL1

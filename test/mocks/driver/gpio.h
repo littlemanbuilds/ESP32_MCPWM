@@ -1,7 +1,11 @@
 /**
  * MIT License
  *
+ * @brief ESP-IDF GPIO include shim for deterministic host tests.
+ *
  * @file gpio.h
+ * @author Little Man Builds (Darren Osborne)
+ * @date 2026-08-07
  * @copyright Copyright (c) 2026 Little Man Builds
  */
 

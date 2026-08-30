@@ -1,7 +1,7 @@
 {
   "name": "ESP32_MCPWM",
-  "version": "1.3.0",
-  "description": "Practical Arduino-ESP32 MCPWM H-bridge driver with safe coast, hard and dither braking, software fault handling, runtime retuning, and edge capture.",
+  "version": "2.0.0",
+  "description": "Explicit Arduino-ESP32 MCPWM H-bridge control with structured operation results, software and hardware fault paths, coast/brake modes, runtime retuning, capture, and diagnostics.",
   "keywords": [
     "arduino",
     "esp32",
@@ -12,19 +12,30 @@
     "bts7960",
     "ibt-2",
     "braking",
-    "fault"
+    "fault",
+    "motor-control"
   ],
   "repository": {
     "type": "git",
     "url": "https://github.com/littlemanbuilds/ESP32_MCPWM.git"
   },
   "authors": [
-    { "name": "Little Man Builds", "email": "littlemanbuilds@gmail.com", "maintainer": true }
+    {
+      "name": "Little Man Builds (Darren Osborne)",
+      "email": "littlemanbuilds@gmail.com",
+      "maintainer": true
+    }
   ],
   "license": "MIT",
-  "frameworks": ["arduino"],
-  "platforms": ["espressif32"],
-  "build": { "includeDir": "src" },
+  "frameworks": [
+    "arduino"
+  ],
+  "platforms": [
+    "espressif32"
+  ],
+  "build": {
+    "includeDir": "src"
+  },
   "examples": [
     "examples/01_BasicMotorControl/01_BasicMotorControl.ino",
     "examples/02_FreewheelAndDitherBrake/02_FreewheelAndDitherBrake.ino",

@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  host:
+    name: Host checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install compilers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang
+
+      - name: Native suite with GCC
+        run: ./test/run_native_tests.sh
+        env:
+          CXX: g++
+
+      - name: Native suite with Clang
+        run: ./test/run_native_tests.sh
+        env:
+          CXX: clang++
+
+      - name: ASan and UBSan
+        run: ./test/run_sanitizers.sh
+        env:
+          CXX: g++
+
+      - name: Example syntax checks
+        run: ./test/check_examples_host.sh
+        env:
+          CXX: g++
+
+      - name: Release contracts
+        run: ./test/check_release_contracts.sh
+
+  platformio:
+    name: PlatformIO ${{ matrix.env }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        env:
+          - esp32-s3-devkitc-1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install PlatformIO
+        run: python -m pip install platformio==6.1.19
+
+      - name: Compile library smoke sketch
+        run: pio ci --project-conf platformio.ini --lib=. -e "${{ matrix.env }}" test/compile_smoke/compile_smoke.ino
+
+  examples:
+    name: ESP32-S3 public examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install PlatformIO
+        run: python -m pip install platformio==6.1.19
+
+      - name: Compile all public ESP32-S3 examples
+        run: |
+          for example in examples/*/*.ino; do
+            pio ci --project-conf platformio.ini --lib=. -e esp32-s3-devkitc-1 "$example"
+          done

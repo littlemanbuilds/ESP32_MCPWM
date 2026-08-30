@@ -1,505 +1,628 @@
 /**
  * MIT License
  *
- * @brief Dual-H-bridge motor driver (ESP32 MCPWM) with soft-brake, dead-time,
- *        center-aligned mode, start/stop, runtime retune, and software fallbacks
- *        for fault (E-stop) and capture (edge-interval measurement).
+ * @brief ESP32 MCPWM H-bridge driver with explicit drive/coast/brake semantics,
+ *        lifecycle results, software fault observation, hardware MCPWM faults,
+ *        dither braking, and edge-interval capture.
  *
  * @file HBridgeMotor.h
  * @author Little Man Builds (Darren Osborne)
  * @date 2025-08-28
- * @copyright Copyright (c) 2025 Little Man Builds
+ * @copyright Copyright (c) 2026 Little Man Builds
+ *
  */
 
 #pragma once
 
+#include "IMotorDriver.h"
+
 #include <Arduino.h>
-#include <cstdint>
 #include <driver/mcpwm.h>
 #include <esp_timer.h>
 #include <freertos/portmacro.h>
-#include <IMotorDriver.h>
+
+#include <cstdint>
+
+#ifndef ESP32_MCPWM_ENABLE_COMMISSIONING_API
+#define ESP32_MCPWM_ENABLE_COMMISSIONING_API 0
+#endif
 
 /**
- * @brief Concrete MCPWM-based dual H-bridge motor driver.
+ * @brief Concrete legacy-ESP-IDF MCPWM dual H-bridge driver.
+ *
+ * @note ESP32_MCPWM v2.x targets the current stable Arduino-ESP32 3.x line,
+ *       whose ESP-IDF 5.x base still provides driver/mcpwm.h. ESP-IDF 6 removes
+ *       the legacy MCPWM driver and requires a future backend migration.
  */
 class HBridgeMotor : public IMotorDriver
 {
-public:
-    /**
-     * @brief Default constructor.
-     */
+  public:
+    /// @brief Construct an unconfigured motor driver.
     HBridgeMotor() = default;
 
-    /**
-     * @brief Virtual destructor for safe polymorphic deletion.
-     */
+    /// @brief Stop timers, detach interrupts, and make a best-effort output shutdown.
     ~HBridgeMotor() noexcept override;
 
-    // ---- Setup ----
+    // ---- Setup ---- //
 
     /**
-     * @brief Initialize the driver with hardware configuration.
+     * @brief Configure hardware with default behavior and no optional observers.
      *
-     * Safe to call again: prior soft-brake timing is stopped and any attached
-     * fault/capture GPIO interrupts are detached before the new setup is applied.
-     * On success, the configured freewheel behavior has been applied. Check
-     * isSetupComplete() before issuing motor commands.
+     * Repeated setup first stops dither, detaches optional interrupts, and
+     * contains resources from the previous setup. On success, the configured
+     * coast state is already applied.
      *
-     * @param hw Hardware configuration for MCPWM and pins.
+     * @param hw MCPWM pin, timer, signal and range configuration.
+     * @return Setup result with detailed failure information.
      */
-    void setup(const MotorMCPWMConfig &hw) override;
+    MotorSetupResult setup(const MotorMCPWMConfig &hw) override;
 
     /**
-     * @brief Initialize the driver with hardware and behavior configuration.
+     * @brief Configure hardware and freewheel/dither behavior.
      *
-     * Safe to call again; previous optional fault/capture interrupts are cleaned up.
-     * On success, the configured freewheel behavior has been applied. Check
-     * isSetupComplete() before issuing motor commands.
+     * Repeated setup cleans up previous timer/interrupt resources before the
+     * replacement configuration is applied. On success, @p beh controls the
+     * already-applied coast state.
      *
-     * @param hw Hardware configuration for MCPWM and pins.
-     * @param beh Behavior configuration (freewheel, soft-brake).
+     * @param hw MCPWM pin, timer, signal and range configuration.
+     * @param beh Freewheel, dither and soft-brake behavior.
+     * @return Setup result with detailed failure information.
      */
-    void setup(const MotorMCPWMConfig &hw, const MotorBehaviorConfig &beh) override;
+    MotorSetupResult setup(const MotorMCPWMConfig &hw, const MotorBehaviorConfig &beh) override;
 
     /**
-     * @brief Initialize the driver with hardware, behavior, safety, and capture configs.
+     * @brief Configure hardware, behavior, software fault observation and capture.
      *
-     * Safe to call again; previous optional fault/capture interrupts are cleaned up.
-     * On success, the configured freewheel behavior has been applied. Check
-     * isSetupComplete() before issuing motor commands.
+     * Repeated setup cleans up previous timer/interrupt resources before the
+     * replacement configuration is applied.
      *
-     * @param hw Hardware configuration for MCPWM and pins.
-     * @param beh Behavior configuration (freewheel, soft-brake).
-     * @param safety Optional safety (fault) configuration.
-     * @param cap Optional capture configuration.
+     * @param hw MCPWM pin, timer, signal and range configuration.
+     * @param beh Freewheel, dither and soft-brake behavior.
+     * @param safety Optional GPIO/ISR software fault observer.
+     * @param cap Optional GPIO edge-interval capture.
+     * @return Setup result with detailed failure information.
      */
-    void setup(const MotorMCPWMConfig &hw, const MotorBehaviorConfig &beh,
-               const MotorSafetyConfig &safety, const MotorCaptureConfig &cap) override;
+    MotorSetupResult setup(const MotorMCPWMConfig &hw, const MotorBehaviorConfig &beh, const MotorSafetyConfig &safety,
+                           const MotorCaptureConfig &cap) override;
 
     /**
-     * @brief Check whether the most recent setup completed successfully.
-     * @return true If hardware resources are ready for motor commands.
-     * @return false Otherwise.
+     * @brief Configure all hardware, behavior, software and MCPWM fault options.
+     *
+     * Existing resources are contained before new configuration is validated;
+     * teardown failure therefore takes precedence over a later validation error.
+     *
+     * @param hw MCPWM pin, timer, signal and range configuration.
+     * @param beh Freewheel, dither and soft-brake behavior.
+     * @param safety Optional GPIO/ISR software fault observer.
+     * @param cap Optional GPIO edge-interval capture.
+     * @param hardware_fault Optional MCPWM peripheral fault input/action.
+     * @return Setup result with detailed failure information.
      */
-    [[nodiscard]] bool isSetupComplete() const noexcept override { return setup_done_; }
+    MotorSetupResult setup(const MotorMCPWMConfig &hw, const MotorBehaviorConfig &beh, const MotorSafetyConfig &safety,
+                           const MotorCaptureConfig &cap, const MotorHardwareFaultConfig &hardware_fault) override;
+
+    /// @brief Return whether setup completed successfully.
+    ESP32_MCPWM_NODISCARD bool isSetupComplete() const noexcept override;
+
+    /// @brief Return the detailed result from the most recent setup attempt.
+    ESP32_MCPWM_NODISCARD MotorSetupError getLastSetupError() const noexcept override;
+
+    // ---- Explicit output control ---- //
 
     /**
-     * @brief Get the result of the most recent setup attempt.
-     * @return MotorSetupError Setup result.
+     * @brief Apply a positive drive request.
+     *
+     * @param speed Positive duty request in [1, getMaxPwmInput()].
+     * @param dir Desired direction.
+     * @return Structured operation result.
      */
-    [[nodiscard]] MotorSetupError getLastSetupError() const noexcept override
+    MotorOperationResult drive(int speed, Dir dir) noexcept override;
+
+    /**
+     * @brief Apply a positive percentage drive request.
+     *
+     * @param percent Positive request in (0,100].
+     * @param dir Desired direction.
+     * @return Structured operation result.
+     */
+    MotorOperationResult drivePercent(float percent, Dir dir) noexcept override;
+
+    /// @brief Apply a positive drive request through the v1-compatible name.
+    MotorOperationResult setSpeed(int speed, Dir dir) noexcept override;
+
+    /// @brief Apply a positive percentage request through the v1-compatible name.
+    MotorOperationResult setSpeedPercent(float percent, Dir dir) noexcept override;
+
+    /// @brief Enter the configured explicit coast/freewheel state.
+    MotorOperationResult coast() noexcept override;
+
+    /// @brief Deassert outputs where possible and stop MCPWM generation.
+    MotorOperationResult disableOutputs() noexcept override
     {
-        return setup_error_;
+        return stop();
     }
 
-    // ---- Core control ----
-
-    /**
-     * @brief Set speed and direction.
-     * @param speed Duty request in [0, getMaxPwmInput()].
-     * @param dir Desired rotation direction.
-     */
-    void setSpeed(int speed, Dir dir) noexcept override;
-
-    /**
-     * @brief Set motor speed as a percentage of the maximum input (0..100).
-     * @param percent Speed request in percent (values outside 0..100 are clamped).
-     * @param dir Desired direction (CW/CCW).
-     */
-    void setSpeedPercent(float percent, Dir dir) noexcept override;
-
-    /**
-     * @brief Enter freewheel (coast) according to current FreewheelMode.
-     */
-    void setFreewheel() noexcept override;
-
-    /**
-     * @brief Apply a hard electronic brake (A=100%, B=100%).
-     */
-    void setHardBrake() noexcept override;
-
-    /**
-     * @brief Set the soft-brake PWM level (0..getMaxPwmInput()).
-     * @param pwm Requested soft-brake level.
-     */
-    void setSoftBrakePWM(uint16_t pwm) noexcept override;
-
-    /**
-     * @brief Convenience to immediately start soft-brake at the given level.
-     * @param pwm Requested soft-brake level.
-     */
-    void softBrakeNow(uint16_t pwm) noexcept;
-
-    /**
-     * @brief Process deferred fault actions and notify callback in normal task context.
-     */
-    void pollFaults() noexcept override;
-
-    /**
-     * @brief Get the maximum accepted logical PWM input.
-     * @return int Maximum input value (e.g., 1023).
-     */
-    [[nodiscard]] int getMaxPwmInput() const noexcept override { return input_max_; }
-
-    /**
-     * @brief Set the freewheel mode for subsequent setFreewheel() calls.
-     * @param mode Freewheel strategy to use.
-     */
-    void setFreewheelMode(FreewheelMode mode) noexcept override;
-
-    /**
-     * @brief Set the freewheel mode and immediately apply freewheel.
-     * @param mode Freewheel strategy to use.
-     */
-    void applyFreewheel(FreewheelMode mode) noexcept override;
-
-    // ---- Lifecycle ----
-
-    /**
-     * @brief Start MCPWM and reapply the configured freewheel state.
-     */
-    void start() noexcept override;
-
-    /**
-     * @brief Deassert EN, set A/B to 0%, and stop the MCPWM outputs.
-     */
-    void stop() noexcept override;
-
-    /**
-     * @brief Attempt to change the PWM frequency at runtime.
-     *
-     * Normal outputs are first brought to disabled zero output. Active dither
-     * restarts after a successful change; failed changes remain inactive.
-     * @param new_hz New frequency in Hz.
-     * @return true If the change was applied.
-     * @return false If not supported or failed.
-     */
-    bool reconfigureFrequency(int new_hz) noexcept override;
-
-    /**
-     * @brief Get the latest measured interval between selected capture edges.
-     * @return uint32_t Edge interval in microseconds, or zero before a valid measurement.
-     */
-    [[nodiscard]] uint32_t getLastCapturePeriodUs() const noexcept override { return period_us_; }
-
-    // ---- Safety / raw outputs ----
-
-    /**
-     * @brief Check whether a one-shot fault is latched or a followed level is active.
-     * @return true If fault output inhibition is active.
-     * @return false Otherwise.
-     */
-    bool hasFault() const noexcept override { return fault_latched_; }
-
-    /**
-     * @brief Check whether a bridge EN pin is configured for library control.
-     * @return true If the configured EN pin can be commanded by the library.
-     * @return false If no EN pin is configured.
-     */
-    [[nodiscard]] bool hasEnableControl() const noexcept override { return use_en_; }
-
-    /**
-     * @brief Clear an inactive latched fault and return to zero-output idle.
-     */
-    void clearFault() noexcept override;
-
-    /**
-     * @brief Force raw outputs (100% on the requested sides).
-     * @param a_high True for high on A side.
-     * @param b_high True for high on B side.
-     */
-    void forceOutputs(bool a_high, bool b_high) noexcept override;
-
-    /**
-     * @brief Optional fault notification callback (level or latched).
-     * @param cb Callback: (active, ctx).
-     * @param ctx Opaque pointer (handed back).
-     */
-    void setFaultCallback(FaultCallback cb, void *ctx) noexcept override
+    /// @brief Enter coast through the v1-compatible freewheel name.
+    MotorOperationResult setFreewheel() noexcept override
     {
-        fault_cb_ = cb;
-        fault_ctx_ = ctx;
+        return coast();
     }
 
-private:
-    // ---- Internal constants ----
-    static constexpr uint32_t kMicrosPerSec = 1000000U; ///< Conversion for Hz→µs.
-    static constexpr float kDutyEps = 0.01f;     ///< Duty cache epsilon.
-    static constexpr int kPwmHzMin = 1;          ///< Lowest accepted drive PWM frequency.
-    static constexpr int kPwmHzMax = 1000000;    ///< Highest accepted drive PWM frequency.
-    static constexpr int kSoftHzMax = 10000;     ///< Highest practical esp_timer dither frequency.
+    /**
+     * @brief Apply explicit full electronic braking.
+     *
+     * @warning Both bridge inputs are driven at full duty. Validate current,
+     *          regeneration, and the module truth table before use on hardware.
+     */
+    MotorOperationResult setHardBrake() noexcept override;
 
-    // ---- Soft-brake phase machine ----
+    /// @brief Set the soft-brake PWM level without starting soft brake.
+    MotorOperationResult setSoftBrakePWM(uint16_t pwm) noexcept override;
+
+    /**
+     * @brief Configure and immediately start explicit soft/dither braking.
+     *
+     * @warning Dither repeatedly alternates electrical brake and coast states.
+     *          Validate bridge current and mechanical response before loaded use.
+     *
+     * @param pwm Brake strength in the configured logical input range.
+     * @return Structured operation result.
+     */
+    MotorOperationResult softBrakeNow(uint16_t pwm) noexcept;
+
+    // ---- Optional fault handling ---- //
+
+    /// @brief Apply deferred software fault work in task context.
+    MotorOperationResult pollFaults() noexcept override;
+
+    /// @brief Return whether software or MCPWM fault state is active or latched.
+    ESP32_MCPWM_NODISCARD bool hasFault() const noexcept override;
+
+    /// @brief Clear inactive fault state and recover to quiet outputs.
+    MotorOperationResult clearFault() noexcept override;
+
+    /**
+     * @brief Register a task-context notification callback for the software fault observer.
+     *
+     * @param cb Callback invoked by pollFaults().
+     * @param ctx Opaque callback context.
+     */
+    void setFaultCallback(FaultCallback cb, void *ctx) noexcept override;
+
+    // ---- Runtime behavior ---- //
+
+    /// @brief Return the configured maximum logical PWM input.
+    ESP32_MCPWM_NODISCARD int getMaxPwmInput() const noexcept override;
+
+    /// @brief Change stored freewheel behavior without applying it unless dither is active.
+    MotorOperationResult setFreewheelMode(FreewheelMode mode) noexcept override;
+
+    /// @brief Change freewheel behavior and immediately apply coast().
+    MotorOperationResult applyFreewheel(FreewheelMode mode) noexcept override;
+
+    /// @brief Start MCPWM generation and return to the configured quiet state.
+    MotorOperationResult start() noexcept override;
+
+    /// @brief Stop MCPWM generation and deassert outputs where possible.
+    MotorOperationResult stop() noexcept override;
+
+    /**
+     * @brief Change drive PWM frequency after moving outputs quiet where possible.
+     *
+     * A successful non-dither change leaves outputs in a zero-duty coast state;
+     * the caller must issue a new drive request. Active dither is restarted only
+     * after the frequency update succeeds.
+     *
+     * @param new_hz Requested drive PWM frequency in Hz.
+     * @return Structured result; an already-current frequency is unchanged success.
+     */
+    MotorOperationResult reconfigureFrequency(int new_hz) noexcept override;
+
+    // ---- Capture ---- //
+
+    /// @brief Return the last selected-edge interval in microseconds, or zero before one exists.
+    ESP32_MCPWM_NODISCARD uint32_t getLastCapturePeriodUs() const noexcept override;
+
+    // ---- Diagnostics / capability ---- //
+
+    /// @brief Return whether an EN pin is configured and controlled by the driver.
+    ESP32_MCPWM_NODISCARD bool hasEnableControl() const noexcept override;
+
+    /// @brief Return a coherent software status snapshot.
+    ESP32_MCPWM_NODISCARD MotorDriverStatus status() const noexcept override;
+
+    /// @brief Return on-demand readback exposed by the legacy MCPWM API.
+    ESP32_MCPWM_NODISCARD MotorHardwareReadback readback() const noexcept override;
+
+    /**
+     * @brief Force raw full-scale A/B outputs for commissioning only.
+     *
+     * The method is inert unless ESP32_MCPWM_ENABLE_COMMISSIONING_API is set to 1
+     * before compiling the library.
+     */
+    MotorOperationResult forceOutputs(bool a_high, bool b_high) noexcept override;
+
+  private:
+    static constexpr uint32_t kMicrosPerSec = 1000000U; ///< Hz-to-µs conversion.
+    static constexpr float kDutyEps = 0.01f;            ///< Duty cache epsilon.
+    static constexpr int kPwmHzMin = 1;                 ///< Lowest accepted drive PWM frequency.
+    static constexpr int kPwmHzMax = 1000000;           ///< Highest accepted drive PWM frequency.
+    static constexpr int kSoftHzMax = 10000;            ///< Highest practical dither frequency.
+
     enum class BrakePhase : uint8_t
     {
         Coast, ///< Coasting phase.
         Brake  ///< Braking phase.
     };
 
+    enum class OutputCommitResult : uint8_t
+    {
+        Committed,     ///< Requested output reached the hardware commit boundary.
+        Stale,         ///< A newer output generation superseded this request.
+        HardwareFailed ///< A hardware API write failed during this generation.
+    };
+
+    enum class TimerCommandResult : uint8_t
+    {
+        Applied,          ///< The requested timer command was applied.
+        StaleOrCancelled, ///< A newer timer or dither generation superseded the request.
+        TimerFailed       ///< The current timer command failed in the ESP timer API.
+    };
+
+    // ---- Result helpers ---- //
+
+    /// @brief Build the structured setup result from synchronized driver state.
+    MotorSetupResult setupResult() const noexcept;
+
     /**
-     * @brief Toggle the soft-brake phase from the esp_timer task.
+     * @brief Record and return a structured operation result.
+     *
+     * @param operation Public operation being completed.
+     * @param error Primary operation diagnosis.
+     * @param changed True only when public semantic or output state changed.
+     * @return Structured operation result and current success sequence.
      */
+    MotorOperationResult result(MotorOperation operation, MotorOperationError error, bool changed = false) noexcept;
+
+    /**
+     * @brief Record and return an unchanged rejected operation.
+     *
+     * @param operation Public operation that was rejected.
+     * @param error Primary rejection diagnosis.
+     * @return Structured unchanged operation result.
+     */
+    MotorOperationResult reject(MotorOperation operation, MotorOperationError error) noexcept;
+
+    /**
+     * @brief Publish the latest operation and diagnosis without advancing success state.
+     *
+     * @param operation Operation to publish.
+     * @param error Primary operation diagnosis.
+     */
+    void recordOperation(MotorOperation operation, MotorOperationError error) noexcept;
+
+    /**
+     * @brief Publish the semantic output mode under the state lock.
+     *
+     * @param mode Truthful mode established by the completed hardware action.
+     */
+    void setOutputMode(MotorOutputMode mode) noexcept;
+
+    // ---- Soft-brake state machine ---- //
+
+    /// @brief Advance one dither phase from ESP timer task context.
     void softBrakeTimerTask() noexcept;
 
     /**
-     * @brief Apply a non-timed brake or coast phase.
-     * @param phase Phase to apply.
+     * @brief Apply one untimed coast or brake endpoint.
+     *
+     * @param phase Endpoint phase to apply.
+     * @return True when the hardware output commit succeeded.
      */
-    void applyPhase(BrakePhase phase) noexcept;
+    bool applyPhase(BrakePhase phase) noexcept;
 
     /**
-     * @brief Apply a timed phase if its dither sequence is still current.
-     * @param phase Phase to apply.
-     * @param sequence Dither sequence that requested the phase.
-     * @return true If the phase was applied and remains current.
-     * @return false If a newer command invalidated the phase.
+     * @brief Commit one dither phase only while its generation remains current.
+     *
+     * @param phase Dither phase to apply.
+     * @param sequence Dither generation that owns the phase.
+     * @return Commit, stale-generation, or hardware-failure outcome.
      */
-    bool applyDitherPhase(BrakePhase phase, uint32_t sequence) noexcept;
+    OutputCommitResult applyDitherPhase(BrakePhase phase, uint32_t sequence) noexcept;
 
     /**
-     * @brief Schedule the next phase if its dither sequence is still current.
-     * @param sequence Dither sequence that requested the timer.
-     * @return true If the next phase was scheduled.
-     * @return false If the sequence is stale or timer scheduling failed.
+     * @brief Schedule the next timer phase for a current dither generation.
+     *
+     * A genuine timer failure terminates the generation and attempts truthful
+     * quiet-output containment before returning. Normal supersession leaves
+     * the newer generation and its diagnostics authoritative.
+     *
+     * @param sequence Dither generation requesting the timer.
+     * @return Applied, stale/cancelled, or genuine timer-failure outcome.
      */
-    bool scheduleNextPhase(uint32_t sequence) noexcept;
+    TimerCommandResult scheduleNextPhase(uint32_t sequence) noexcept;
 
-    /**
-     * @brief Begin soft-brake dither or apply a steady endpoint state.
-     */
-    void startSoftBrake() noexcept;
+    /// @brief Start dither braking or apply its steady zero/full endpoint.
+    MotorOperationError startSoftBrake() noexcept;
 
-    /**
-     * @brief Stop soft-brake dither and invalidate pending callbacks.
-     */
+    /// @brief Stop dither timing and invalidate all callbacks from older generations.
     void stopSoftBrake() noexcept;
 
-    // ---- GPIO / IO helpers ----
+    /// @brief Terminate failed dither work and publish contained or uncertain output truth.
+    void containFailedDither() noexcept;
 
     /**
-     * @brief Control the optional bridge EN pin.
-     * @param enabled True to assert EN, false to deassert it.
+     * @brief Contain and publish an authoritative dither timer failure.
+     *
+     * @param sequence Dither generation that encountered the timer failure.
+     * @return Timer failure while authoritative, otherwise stale/cancelled.
      */
-    void setEnable(bool enabled) noexcept;
+    TimerCommandResult containDitherTimerFailure(uint32_t sequence) noexcept;
 
-    /**
-     * @brief Write the MCPWM A and B duty values.
-     * @param a_percent A-channel duty in percent.
-     * @param b_percent B-channel duty in percent.
-     */
-    void writeAB(float a_percent, float b_percent) noexcept;
-
-    /**
-     * @brief Apply one output snapshot in a safe transition order.
-     * @param enable Desired EN state.
-     * @param a_percent Desired A-channel duty in percent.
-     * @param b_percent Desired B-channel duty in percent.
-     */
-    void writeHardwareOutput(bool enable, float a_percent, float b_percent) noexcept;
-
-    /**
-     * @brief Apply the newest output if the supplied snapshot becomes stale.
-     * @param sequence Output sequence associated with the snapshot.
-     * @param enable Desired EN state.
-     * @param a_percent Desired A-channel duty in percent.
-     * @param b_percent Desired B-channel duty in percent.
-     */
-    void writeOutputUntilCurrent(uint32_t sequence, bool enable,
-                                 float a_percent, float b_percent) noexcept;
-
-    /**
-     * @brief Publish and apply a new output command.
-     * @param enable Desired EN state.
-     * @param a_percent Desired A-channel duty in percent.
-     * @param b_percent Desired B-channel duty in percent.
-     */
-    void commandOutput(bool enable, float a_percent, float b_percent) noexcept;
-
-    /**
-     * @brief Apply the newest timer command if the supplied command becomes stale.
-     * @param sequence Timer sequence associated with the command.
-     * @param active True to start the timer, false to stop it.
-     * @param timeout_us One-shot timeout in microseconds.
-     * @return true If the current timer command was applied successfully.
-     * @return false If the current timer start failed.
-     */
-    bool writeTimerUntilCurrent(uint32_t sequence, bool active,
-                                int64_t timeout_us) noexcept;
-
-    // ---- Calculations ----
-
-    /**
-     * @brief Recompute the brake and coast durations for the current dither level.
-     * @return true If valid durations were calculated.
-     * @return false If the configured timing cannot form a valid period.
-     */
+    /// @brief Recompute brake/coast durations from configured frequency and strength.
     bool recomputeSoftDurations() noexcept;
 
-    // ---- Safety (software fallback) ----
+    // ---- Hardware output helpers ---- //
 
     /**
-     * @brief Forward the static fault interrupt to its driver instance.
-     * @param arg Driver instance supplied to attachInterruptArg().
+     * @brief Commit A/B/EN output state while its generation remains current.
+     *
+     * The caller holds the recursive state critical section across freshness
+     * checks and physical writes so older deferred work cannot overwrite a
+     * newer completed command.
+     *
+     * @param sequence Output generation to commit.
+     * @param enable Desired logical bridge-enable state.
+     * @param a_percent A-channel duty in percent.
+     * @param b_percent B-channel duty in percent.
+     * @return Commit, stale-generation, or hardware-failure outcome.
+     */
+    OutputCommitResult writeHardwareOutput(uint32_t sequence, bool enable, float a_percent, float b_percent) noexcept;
+
+    /**
+     * @brief Publish and synchronously commit one hardware output request.
+     *
+     * @param enable Desired logical bridge-enable state.
+     * @param a_percent A-channel duty in percent.
+     * @param b_percent B-channel duty in percent.
+     * @return True when the request reached the hardware commit boundary.
+     */
+    bool commandOutput(bool enable, float a_percent, float b_percent) noexcept;
+
+    /**
+     * @brief Apply the newest timer command when the supplied generation is stale.
+     *
+     * @param sequence Timer generation to apply first.
+     * @param active True to schedule a one-shot callback; false to stop it.
+     * @param timeout_us One-shot interval in microseconds.
+     * @return Applied, stale/cancelled, or genuine timer-failure outcome.
+     */
+    TimerCommandResult writeTimerUntilCurrent(uint32_t sequence, bool active, int64_t timeout_us) noexcept;
+
+    // ---- Software fault observer ---- //
+
+    /**
+     * @brief Forward the static GPIO fault interrupt to its motor instance.
+     *
+     * @param arg HBridgeMotor instance supplied to attachInterruptArg().
      */
     static void IRAM_ATTR faultISRThunk(void *arg);
 
-    /**
-     * @brief Sample the fault input and defer safety work to task context.
-     */
+    /// @brief Sample software-fault GPIO state and defer task-context handling.
     void IRAM_ATTR faultISR() noexcept;
 
-    /**
-     * @brief Read whether the configured fault input is active.
-     * @return true If the configured active level is present.
-     * @return false Otherwise.
-     */
+    /// @brief Return whether the configured software-fault GPIO level is active.
     bool IRAM_ATTR faultInputActive() const noexcept;
 
-    /**
-     * @brief Apply the configured low-level fault action.
-     */
-    void applyFaultAction() noexcept;
+    /// @brief Return a synchronized snapshot of active or latched software fault state.
+    bool softwareFaultActiveSnapshot() const noexcept;
 
-    /**
-     * @brief Apply the full electronic brake and keep MCPWM running.
-     */
-    void emergencyBrake() noexcept;
+    /// @brief Return a synchronized snapshot of deferred software-fault work.
+    bool softwareFaultPendingSnapshot() const noexcept;
 
-    /**
-     * @brief Detach the configured fault interrupt if one is attached.
-     */
+    /// @brief Apply the configured scheduler-dependent software-fault action.
+    MotorOperationError applyFaultAction() noexcept;
+
+    /// @brief Apply the configured explicit full electronic brake for a fault action.
+    MotorOperationError emergencyBrake() noexcept;
+
+    /// @brief Detach the software-fault GPIO interrupt when configured.
     void detachFaultInterrupt() noexcept;
 
-    // ---- Capture (software fallback) ----
+    // ---- MCPWM hardware fault path ---- //
 
     /**
-     * @brief Forward the static capture interrupt to its driver instance.
-     * @param arg Driver instance supplied to attachInterruptArg().
+     * @brief Map the public fault selection to an MCPWM GPIO routing signal.
+     *
+     * @param input Public hardware-fault input selection.
+     * @return Legacy MCPWM GPIO routing signal.
+     */
+    mcpwm_io_signals_t hardwareFaultIoSignal(HardwareFaultInput input) const noexcept;
+
+    /**
+     * @brief Map the public fault selection to an MCPWM fault signal.
+     *
+     * @param input Public hardware-fault input selection.
+     * @return Legacy MCPWM peripheral fault signal.
+     */
+    mcpwm_fault_signal_t hardwareFaultSignal(HardwareFaultInput input) const noexcept;
+
+    /**
+     * @brief Forward the hardware-fault GPIO interrupt to its motor instance.
+     *
+     * @param arg HBridgeMotor instance supplied to attachInterruptArg().
+     */
+    static void IRAM_ATTR hardwareFaultISRThunk(void *arg);
+
+    /// @brief Observe peripheral fault input state for coherent diagnostics.
+    void IRAM_ATTR hardwareFaultISR() noexcept;
+
+    /// @brief Configure exact MCPWM A/B hardware-fault actions and observation.
+    bool configureHardwareFault() noexcept;
+
+    /// @brief Re-arm a one-shot hardware fault after quiet output staging.
+    bool rearmHardwareFault() noexcept;
+
+    /// @brief Detach and deinitialize the MCPWM hardware-fault path.
+    bool detachHardwareFault() noexcept;
+
+    /// @brief Return whether the configured hardware-fault GPIO level is active.
+    bool hardwareFaultInputActive() const noexcept;
+
+    // ---- Capture ---- //
+
+    /**
+     * @brief Forward the static capture interrupt to its motor instance.
+     *
+     * @param arg HBridgeMotor instance supplied to attachInterruptArg().
      */
     static void IRAM_ATTR capISRThunk(void *arg);
 
-    /**
-     * @brief Measure the interval since the previous selected capture edge.
-     */
+    /// @brief Measure one selected-edge interval and invoke the optional ISR callback.
     void IRAM_ATTR capISR() noexcept;
 
-    /**
-     * @brief Detach the configured capture interrupt if one is attached.
-     */
+    /// @brief Detach the capture GPIO interrupt when configured.
     void detachCaptureInterrupt() noexcept;
 
-    // ---- Setup / teardown helpers ----
+    // ---- Setup / teardown ---- //
+
+    /// @brief Tear down previous resources and contain outputs before a setup attempt.
+    MotorSetupError prepareForSetup() noexcept;
 
     /**
-     * @brief Stop and detach existing resources before a setup attempt.
+     * @brief Validate all setup configuration before touching hardware resources.
+     *
+     * @param hw MCPWM routing and electrical-interface configuration.
+     * @param beh Coast and dither behavior configuration.
+     * @param safety Software-fault observer configuration.
+     * @param cap GPIO capture configuration.
+     * @param hardware_fault MCPWM peripheral fault configuration.
+     * @return Specific validation error or MotorSetupError::None.
      */
-    void prepareForSetup() noexcept;
+    MotorSetupError validateConfig(const MotorMCPWMConfig &hw, const MotorBehaviorConfig &beh,
+                                   const MotorSafetyConfig &safety, const MotorCaptureConfig &cap,
+                                   const MotorHardwareFaultConfig &hardware_fault) const noexcept;
 
     /**
-     * @brief Validate user configuration before touching MCPWM resources.
-     * @param hw Hardware configuration to validate.
-     * @param beh Behavior configuration to validate.
-     * @param safety Safety configuration to validate.
-     * @param cap Capture configuration to validate.
-     * @return MotorSetupError::None If the configuration is valid.
-     * @return MotorSetupError A specific validation failure otherwise.
-     */
-    MotorSetupError validateConfig(const MotorMCPWMConfig &hw,
-                                   const MotorBehaviorConfig &beh,
-                                   const MotorSafetyConfig &safety,
-                                   const MotorCaptureConfig &cap) const noexcept;
-
-    /**
-     * @brief Leave a failed setup attempt in an inactive state.
-     * @param error Error to expose through getLastSetupError().
+     * @brief Roll back a failed setup and preserve containment failure precedence.
+     *
+     * @param error Primary setup-stage error being handled.
      */
     void failSetup(MotorSetupError error) noexcept;
 
-    // ---- State (hardware & behavior) ----
-    // Pins & routing.
-    int lpwm_pin_{-1};                         ///< LPWM pin.
-    int rpwm_pin_{-1};                         ///< RPWM pin.
-    int en_pin_{-1};                           ///< Enable pin; -1 if unused.
-    mcpwm_unit_t mcpwm_unit_{MCPWM_UNIT_0};    ///< MCPWM unit.
-    mcpwm_timer_t mcpwm_timer_{MCPWM_TIMER_0}; ///< MCPWM timer.
-    mcpwm_io_signals_t mcpwm_sig_l_{MCPWM0A};  ///< MCPWM signal for LPWM.
-    mcpwm_io_signals_t mcpwm_sig_r_{MCPWM0B};  ///< MCPWM signal for RPWM.
+    // ---- Synchronization ---- //
 
-    // ---- Config mirrors ----
-    int pwm_freq_hz_{20000};                              ///< PWM frequency (Hz).
-    int input_max_{1023};                                 ///< Max logical input.
-    float percent_per_count_{0.0f};                       ///< 100 / input_max.
-    uint32_t min_phase_us_{50};                           ///< Minimum dither phase (µs).
-    bool dither_coast_hi_z_{false};                       ///< Dither brake coast uses Hi-Z (EN low) when true.
-    mcpwm_counter_type_t counter_mode_{MCPWM_UP_COUNTER}; ///< Counter mode.
-    MotorBehaviorConfig beh_{};                           ///< Behavior config.
-    MotorSafetyConfig safety_{};                          ///< Safety config.
-    MotorCaptureConfig cap_{};                            ///< Capture config.
-    bool setup_done_{false};                              ///< True after MCPWM setup has completed.
-    bool mcpwm_initialized_{false};                       ///< True after MCPWM timer initialization.
-    bool deadtime_enabled_{false};                        ///< True while MCPWM dead-time is configured.
-    MotorSetupError setup_error_{MotorSetupError::None};  ///< Most recent setup result.
+    /// @brief Enter the task-context recursive state critical section.
+    inline void lockState() const noexcept
+    {
+        portENTER_CRITICAL(&state_mux_);
+    }
 
-    // ---- EN control ----
-    bool use_en_{false};   ///< True if EN pin is used.
-    bool en_state_{false}; ///< Cached EN state.
+    /// @brief Leave the task-context recursive state critical section.
+    inline void unlockState() const noexcept
+    {
+        portEXIT_CRITICAL(&state_mux_);
+    }
 
-    // ---- Soft-brake runtime ----
-    esp_timer_handle_t soft_timer_{nullptr};   ///< esp_timer used for dither.
-    bool soft_active_{false};                  ///< True if dither is running.
-    BrakePhase soft_phase_{BrakePhase::Coast}; ///< Current dither phase.
-    int soft_hz_{300};                         ///< Dither frequency (Hz).
-    int64_t soft_us_brake_{0};                 ///< Brake phase duration (µs).
-    int64_t soft_us_coast_{0};                 ///< Coast phase duration (µs).
-    uint16_t soft_brake_pwm_{0};               ///< Current soft-brake PWM request.
-    uint32_t soft_sequence_{0};                 ///< Invalidates callbacks from older dither cycles.
+    /// @brief Enter the ISR-context recursive state critical section.
+    inline void lockStateISR() const noexcept
+    {
+        portENTER_CRITICAL_ISR(&state_mux_);
+    }
 
-    // ---- Safety (fault) ----
-    volatile bool fault_latched_{false}; ///< Latched fault state.
-    volatile bool fault_pending_{false}; ///< ISR posts work for task context.
-    FaultCallback fault_cb_{nullptr};    ///< User fault callback.
-    void *fault_ctx_{nullptr};           ///< User context pointer.
-    int fault_irq_pin_{-1};              ///< Attached fault interrupt pin.
+    /// @brief Leave the ISR-context recursive state critical section.
+    inline void unlockStateISR() const noexcept
+    {
+        portEXIT_CRITICAL_ISR(&state_mux_);
+    }
 
-    // ---- Capture (edge-interval measurement) ----
-    volatile uint32_t last_edge_us_{0}; ///< Last edge timestamp (µs).
-    volatile uint32_t period_us_{0};    ///< Measured selected-edge interval (µs).
-    volatile bool capture_edge_seen_{false}; ///< True after the first selected edge.
-    int cap_irq_pin_{-1};               ///< Attached capture interrupt pin.
+    // ---- Hardware / configuration ---- //
 
-    // ---- Concurrency & caching ----
-    mutable portMUX_TYPE soft_mux_ = portMUX_INITIALIZER_UNLOCKED;             ///< Tiny critical section.
-    /**
-     * @brief Enter the critical section protecting dither and output state.
-     */
-    inline void lockSoft() const noexcept { portENTER_CRITICAL(&soft_mux_); }
+    int lpwm_pin_{-1};                         ///< GPIO routed to MCPWM output A/LPWM.
+    int rpwm_pin_{-1};                         ///< GPIO routed to MCPWM output B/RPWM.
+    int en_pin_{-1};                           ///< Optional bridge-enable GPIO, or -1 when absent.
+    mcpwm_unit_t mcpwm_unit_{MCPWM_UNIT_0};    ///< MCPWM peripheral unit owned by this instance.
+    mcpwm_timer_t mcpwm_timer_{MCPWM_TIMER_0}; ///< MCPWM timer owned by this instance.
+    mcpwm_io_signals_t mcpwm_sig_l_{MCPWM0A};  ///< Peripheral signal routed to LPWM.
+    mcpwm_io_signals_t mcpwm_sig_r_{MCPWM0B};  ///< Peripheral signal routed to RPWM.
 
-    /**
-     * @brief Exit the critical section protecting dither and output state.
-     */
-    inline void unlockSoft() const noexcept { portEXIT_CRITICAL(&soft_mux_); }
-    float last_a_percent_{-1.0f};                                              ///< Cached last A duty.
-    float last_b_percent_{-1.0f};                                              ///< Cached last B duty.
-    uint32_t output_sequence_{0};                                              ///< Identifies the latest output command.
-    bool commanded_enable_{false};                                             ///< Latest requested EN state.
-    float commanded_a_percent_{0.0f};                                         ///< Latest requested A duty.
-    float commanded_b_percent_{0.0f};                                         ///< Latest requested B duty.
-    uint32_t timer_sequence_{0};                                               ///< Identifies the latest timer command.
-    bool commanded_timer_active_{false};                                      ///< Latest requested timer state.
-    int64_t commanded_timer_us_{0};                                           ///< Latest requested timer delay.
+    int pwm_freq_hz_{20000};                              ///< Last successfully configured drive frequency in Hz.
+    int input_max_{1023};                                 ///< Maximum accepted logical drive/brake request.
+    float percent_per_count_{0.0f};                       ///< Logical-input to duty-percent conversion factor.
+    uint32_t min_phase_us_{50};                           ///< Minimum requested dither phase duration in microseconds.
+    bool dither_coast_hi_z_{false};                       ///< True to deassert EN during each dither coast phase.
+    mcpwm_counter_type_t counter_mode_{MCPWM_UP_COUNTER}; ///< Configured MCPWM counter mode.
+    MotorBehaviorConfig beh_{};                           ///< Accepted coast and dither behavior snapshot.
+    MotorSafetyConfig safety_{};                          ///< Accepted software-fault observer snapshot.
+    MotorCaptureConfig cap_{};                            ///< Accepted edge-capture configuration snapshot.
+    MotorHardwareFaultConfig hardware_fault_{};           ///< Accepted peripheral fault configuration snapshot.
 
-    // ---- Non-copyable ----
-    /**
-     * @brief Disable copy construction because each instance owns hardware resources.
-     * @param other Instance that would otherwise be copied.
-     */
+    bool setup_done_{false};              ///< True only after all setup and initial containment succeeds.
+    bool mcpwm_initialized_{false};       ///< True while MCPWM resources require teardown.
+    bool mcpwm_running_{false};           ///< Cached lifecycle state after successful start/stop calls.
+    bool deadtime_enabled_{false};        ///< True while dead-time requires explicit teardown.
+    bool hardware_fault_enabled_{false};  ///< True while the MCPWM peripheral fault path is configured.
+    bool hardware_fault_active_{false};   ///< Synchronized current peripheral fault GPIO level.
+    bool hardware_fault_latched_{false};  ///< One-shot fault observed and awaiting safe re-arm.
+    uint32_t hardware_fault_sequence_{0}; ///< Monotonic observed hardware-fault transition count.
+    int hardware_fault_irq_pin_{-1};      ///< Attached hardware-fault observer GPIO, or -1.
+    MotorSetupError setup_error_{MotorSetupError::None}; ///< Most recent setup or teardown diagnosis.
+
+    // ---- EN ---- //
+
+    bool use_en_{false};   ///< True when this instance owns an EN GPIO.
+    bool en_state_{false}; ///< Cached physical EN level last written by the driver.
+
+    // ---- Soft brake ---- //
+
+    esp_timer_handle_t soft_timer_{nullptr};   ///< Owned one-shot ESP timer for dither phase changes.
+    bool soft_active_{false};                  ///< True only while a dither generation has future work.
+    BrakePhase soft_phase_{BrakePhase::Coast}; ///< Most recently committed/current dither phase.
+    int soft_hz_{300};                         ///< Configured dither cycle frequency in Hz.
+    int64_t soft_us_brake_{0};                 ///< Calculated brake-phase duration in microseconds.
+    int64_t soft_us_coast_{0};                 ///< Calculated coast-phase duration in microseconds.
+    uint16_t soft_brake_pwm_{0};               ///< Current dither strength in logical input units.
+    uint32_t soft_sequence_{0};                ///< Generation token invalidating stale dither callbacks.
+
+    // ---- Software fault observer ---- //
+
+    bool fault_latched_{false};       ///< Active or one-shot-latched software fault state.
+    bool fault_pending_{false};       ///< ISR-posted work awaiting pollFaults().
+    uint32_t fault_sequence_{0};      ///< Monotonic software-fault transition count.
+    FaultCallback fault_cb_{nullptr}; ///< Optional task-context observer callback.
+    void *fault_ctx_{nullptr};        ///< Caller-owned context passed to fault_cb_.
+    int fault_irq_pin_{-1};           ///< Attached software-fault GPIO, or -1.
+
+    // ---- Capture ---- //
+
+    uint32_t last_edge_us_{0};      ///< micros() timestamp of the previous selected edge.
+    uint32_t period_us_{0};         ///< Most recent adjacent selected-edge interval in microseconds.
+    bool capture_edge_seen_{false}; ///< True after the first edge establishes a timestamp.
+    uint32_t capture_sequence_{0};  ///< Monotonic completed capture-interval count.
+    int cap_irq_pin_{-1};           ///< Attached capture GPIO, or -1.
+
+    // ---- Output / operation state ---- //
+
+    mutable portMUX_TYPE state_mux_ =
+        portMUX_INITIALIZER_UNLOCKED;    ///< Recursive ISR/task state and output-commit lock.
+    float last_a_percent_{-1.0f};        ///< Last successfully committed A duty percent.
+    float last_b_percent_{-1.0f};        ///< Last successfully committed B duty percent.
+    uint32_t output_sequence_{0};        ///< Generation token linearizing all physical output commits.
+    bool commanded_enable_{false};       ///< Enable intent of the newest published output generation.
+    float commanded_a_percent_{0.0f};    ///< A duty intent of the newest output generation.
+    float commanded_b_percent_{0.0f};    ///< B duty intent of the newest output generation.
+    uint32_t timer_sequence_{0};         ///< Generation token linearizing timer start/stop commands.
+    bool commanded_timer_active_{false}; ///< Active state requested by the newest timer generation.
+    int64_t commanded_timer_us_{0};      ///< One-shot interval owned by the newest timer generation.
+
+    MotorOutputMode output_mode_{MotorOutputMode::Unconfigured}; ///< Truthful public semantic output state.
+    uint32_t operation_sequence_{0};                      ///< Monotonic count of successfully completed operations.
+    MotorOperation last_operation_{MotorOperation::None}; ///< Most recently attempted public operation.
+    MotorOperationError last_operation_error_{MotorOperationError::None}; ///< Primary diagnosis of last operation.
+
+    /// @brief Prevent copying an instance that owns timers, interrupts, and MCPWM state.
     HBridgeMotor(const HBridgeMotor &other) = delete;
 
-    /**
-     * @brief Disable copy assignment because each instance owns hardware resources.
-     * @param other Instance that would otherwise be copied.
-     * @return HBridgeMotor& This instance; declaration is deleted and cannot be called.
-     */
+    /// @brief Prevent assignment between instances that own hardware resources.
     HBridgeMotor &operator=(const HBridgeMotor &other) = delete;
 };

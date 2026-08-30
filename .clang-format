@@ -1,0 +1,24 @@
+# Little Man Builds C/C++ formatting baseline.
+#
+# Keep this file public so editors, contributors and CI use the same recorded
+# formatting rules. Formatting is deterministic and should not create review
+# churn across otherwise unrelated engineering changes.
+
+BasedOnStyle: Microsoft
+Language: Cpp
+
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 120
+
+BreakBeforeBraces: Allman
+AlignTrailingComments: true
+ReflowComments: false
+
+# LMB has an explicit include hierarchy checked separately.
+SortIncludes: false
+
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
