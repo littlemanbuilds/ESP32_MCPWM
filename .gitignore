@@ -11,6 +11,7 @@ build/
 
 # OS metadata
 .DS_Store
+._*
 Thumbs.db
 __MACOSX/
 
@@ -29,20 +30,17 @@ compile_commands.json
 cmake-build-*/
 
 # Test / coverage output
+.native-build/
 test/build/
+tests/build/
 .test-results/
 coverage/
+*.gcda
+*.gcno
+*.gcov
+*.profraw
+*.profdata
 
 # Local release archives
 *.zip
 *.ZIP
-
-# LMB required shared ignores
-AGENTS.md
-.lmb/
-._*
-.native-build/
-tests/build/
-*.gcda
-*.gcno
-*.gcov
