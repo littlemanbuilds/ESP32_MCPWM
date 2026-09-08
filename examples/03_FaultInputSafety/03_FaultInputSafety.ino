@@ -29,7 +29,9 @@ MotorMCPWMConfig hardware{LPWM_PIN, RPWM_PIN, EN_PIN, MCPWM_UNIT_0, MCPWM_TIMER_
 MotorSafetyConfig safety;
 Motor motor;
 bool fault_reported = false;
-bool drive_armed = true;
+bool drive_armed = false;
+// A failed clear can release the library latch; retain our own recovery inhibit.
+bool recovery_required = false;
 
 // ---- Setup ---- //
 
@@ -50,11 +52,20 @@ void setup()
             delay(1000);
     }
 
-    motor.pollFaults();
-    if (!motor.hasFault())
+    const MotorOperationResult poll_result = motor.pollFaults();
+    if (!poll_result.ok() || motor.hasFault())
     {
-        Serial.println("Motor running at 30%. Ground GPIO 7 to assert the fault.");
-        motor.drivePercent(30, Dir::CW);
+        recovery_required = true;
+    }
+    else
+    {
+        const MotorOperationResult drive_result = motor.drivePercent(30, Dir::CW);
+        drive_armed = drive_result.ok();
+        recovery_required = !drive_armed;
+        if (drive_armed)
+            Serial.println("Motor running at 30%. Ground GPIO 7 to assert the fault.");
+        else
+            Serial.println("Initial drive failed. Recovery is required.");
     }
 }
 
@@ -63,30 +74,52 @@ void setup()
 void loop()
 {
     // The GPIO ISR only records fault state; polling owns the bridge action.
-    motor.pollFaults();
-
-    if (motor.hasFault())
+    const MotorOperationResult poll_result = motor.pollFaults();
+    if (!poll_result.ok() || motor.hasFault())
     {
+        recovery_required = true;
         drive_armed = false;
-        if (!fault_reported)
-        {
-            Serial.println("Fault latched. Release GPIO 7, then send c to clear.");
-            fault_reported = true;
-        }
-
-        if (Serial.available() && Serial.read() == 'c')
-        {
-            motor.clearFault();
-            if (!motor.hasFault())
-                Serial.println("Cleared at zero output. Send d for a new drive command.");
-        }
     }
-    else if (!drive_armed && Serial.available() && Serial.read() == 'd')
+
+    if (recovery_required && !fault_reported)
     {
-        motor.drivePercent(30, Dir::CW);
-        drive_armed = true;
-        fault_reported = false;
-        Serial.println("New drive command accepted.");
+        Serial.println("Drive inhibited. Release GPIO 7, then send c to clear.");
+        fault_reported = true;
+    }
+
+    if (Serial.available())
+    {
+        const int command = Serial.read();
+        // Allow retries even when a failed clear has released the library latch.
+        if (command == 'c' && recovery_required)
+        {
+            const MotorOperationResult clear_result = motor.clearFault();
+            if (clear_result.ok())
+            {
+                recovery_required = false;
+                fault_reported = false;
+                Serial.println("Cleared at zero output. Send d for a new drive command.");
+            }
+            else
+                Serial.println("Recovery failed. Drive remains inhibited; send c to retry.");
+        }
+        else if (command == 'd' && !drive_armed)
+        {
+            if (recovery_required || motor.hasFault())
+                Serial.println("Drive inhibited. Successful recovery is required first.");
+            else
+            {
+                const MotorOperationResult drive_result = motor.drivePercent(30, Dir::CW);
+                drive_armed = drive_result.ok();
+                if (drive_armed)
+                    Serial.println("New drive command accepted.");
+                else
+                {
+                    recovery_required = true;
+                    Serial.println("Drive failed. Recovery is required.");
+                }
+            }
+        }
     }
 
     delay(10); // Keeps deferred fault response prompt without busy-waiting.

@@ -101,10 +101,14 @@ class HBridgeMotor : public IMotorDriver
     MotorSetupResult setup(const MotorMCPWMConfig &hw, const MotorBehaviorConfig &beh, const MotorSafetyConfig &safety,
                            const MotorCaptureConfig &cap, const MotorHardwareFaultConfig &hardware_fault) override;
 
-    /// @brief Return whether setup completed successfully.
+    /// @brief Return the retained setup-complete state.
+    ///
+    /// @return True after setup, including failed replacement teardown that retains the old setup; false otherwise.
     ESP32_MCPWM_NODISCARD bool isSetupComplete() const noexcept override;
 
     /// @brief Return the detailed result from the most recent setup attempt.
+    ///
+    /// @return Most recent setup or containment error, or None when no setup error is recorded.
     ESP32_MCPWM_NODISCARD MotorSetupError getLastSetupError() const noexcept override;
 
     // ---- Explicit output control ---- //
@@ -128,21 +132,35 @@ class HBridgeMotor : public IMotorDriver
     MotorOperationResult drivePercent(float percent, Dir dir) noexcept override;
 
     /// @brief Apply a positive drive request through the v1-compatible name.
+    ///
+    /// @param speed Positive logical drive demand; HBridgeMotor clamps values above getMaxPwmInput().
+    /// @param dir Requested motor direction.
+    /// @return Drive result; nonpositive demand is rejected as InvalidCommand.
     MotorOperationResult setSpeed(int speed, Dir dir) noexcept override;
 
     /// @brief Apply a positive percentage request through the v1-compatible name.
+    ///
+    /// @param percent Positive drive percentage; HBridgeMotor clamps finite values above 100.
+    /// @param dir Requested motor direction.
+    /// @return Drive result; nonpositive or nonfinite demand is rejected by HBridgeMotor.
     MotorOperationResult setSpeedPercent(float percent, Dir dir) noexcept override;
 
     /// @brief Enter the configured explicit coast/freewheel state.
+    ///
+    /// @return Coast result, including setup, fault, output-write or dither failures.
     MotorOperationResult coast() noexcept override;
 
     /// @brief Deassert outputs where possible and stop MCPWM generation.
+    ///
+    /// @return Stop result, including output-write and peripheral-stop failures.
     MotorOperationResult disableOutputs() noexcept override
     {
         return stop();
     }
 
     /// @brief Enter coast through the v1-compatible freewheel name.
+    ///
+    /// @return Result of the explicit configured coast request.
     MotorOperationResult setFreewheel() noexcept override
     {
         return coast();
@@ -153,10 +171,15 @@ class HBridgeMotor : public IMotorDriver
      *
      * @warning Both bridge inputs are driven at full duty. Validate current,
      *          regeneration, and the module truth table before use on hardware.
+     *
+     * @return Brake result; failure means the requested brake state was not established.
      */
     MotorOperationResult setHardBrake() noexcept override;
 
     /// @brief Set the soft-brake PWM level without starting soft brake.
+    ///
+    /// @param pwm Logical brake level, clamped by HBridgeMotor to [0, getMaxPwmInput()].
+    /// @return Configuration result; HBridgeMotor clamps the level and restarts already-active dither.
     MotorOperationResult setSoftBrakePWM(uint16_t pwm) noexcept override;
 
     /**
@@ -173,12 +196,22 @@ class HBridgeMotor : public IMotorDriver
     // ---- Optional fault handling ---- //
 
     /// @brief Apply deferred software fault work in task context.
+    ///
+    /// @return Deferred handling result; unchanged success when HBridgeMotor has no pending work.
     MotorOperationResult pollFaults() noexcept override;
 
     /// @brief Return whether software or MCPWM fault state is active or latched.
+    ///
+    /// @return True when a software or hardware fault is active or latched; false otherwise.
     ESP32_MCPWM_NODISCARD bool hasFault() const noexcept override;
 
     /// @brief Clear inactive fault state and recover to quiet outputs.
+    ///
+    /// The software latch is cleared before fallible output writes and peripheral recovery.
+    /// If recovery fails, hasFault() may be false and later drive commands may be accepted.
+    /// Keep an application-owned drive inhibit until a clearFault() result reports success.
+    ///
+    /// @return Recovery result; active inputs or failed containment/re-arm prevent successful recovery.
     MotorOperationResult clearFault() noexcept override;
 
     /**
@@ -192,18 +225,30 @@ class HBridgeMotor : public IMotorDriver
     // ---- Runtime behavior ---- //
 
     /// @brief Return the configured maximum logical PWM input.
+    ///
+    /// @return Configured positive upper bound for logical drive demand.
     ESP32_MCPWM_NODISCARD int getMaxPwmInput() const noexcept override;
 
     /// @brief Change stored freewheel behavior without applying it unless dither is active.
+    ///
+    /// @param mode Requested freewheel behavior for subsequent coast requests.
+    /// @return Configuration result; changing mode cancels active dither and applies its coast phase.
     MotorOperationResult setFreewheelMode(FreewheelMode mode) noexcept override;
 
     /// @brief Change freewheel behavior and immediately apply coast().
+    ///
+    /// @param mode Requested freewheel behavior for subsequent coast requests.
+    /// @return Configuration failure or the result of applying the newly configured coast state.
     MotorOperationResult applyFreewheel(FreewheelMode mode) noexcept override;
 
-    /// @brief Start MCPWM generation and return to the configured quiet state.
+    /// @brief Start MCPWM generation and apply configured coast or dither behavior.
+    ///
+    /// @return Lifecycle result; success establishes configured coast/dither, never restores prior drive.
     MotorOperationResult start() noexcept override;
 
     /// @brief Stop MCPWM generation and deassert outputs where possible.
+    ///
+    /// @return Lifecycle result; success means zero duty was written and MCPWM was stopped.
     MotorOperationResult stop() noexcept override;
 
     /**
@@ -221,17 +266,25 @@ class HBridgeMotor : public IMotorDriver
     // ---- Capture ---- //
 
     /// @brief Return the last selected-edge interval in microseconds, or zero before one exists.
+    ///
+    /// @return Unsigned microseconds between the last selected edges, or zero before an interval exists.
     ESP32_MCPWM_NODISCARD uint32_t getLastCapturePeriodUs() const noexcept override;
 
     // ---- Diagnostics / capability ---- //
 
     /// @brief Return whether an EN pin is configured and controlled by the driver.
+    ///
+    /// @return True when an independent EN GPIO is configured; false when absent.
     ESP32_MCPWM_NODISCARD bool hasEnableControl() const noexcept override;
 
     /// @brief Return a coherent software status snapshot.
+    ///
+    /// @return Synchronized software snapshot; commanded duties and cached lifecycle are not physical measurements.
     ESP32_MCPWM_NODISCARD MotorDriverStatus status() const noexcept override;
 
     /// @brief Return on-demand readback exposed by the legacy MCPWM API.
+    ///
+    /// @return Available peripheral/GPIO readings, with valid false before setup; running state remains cached.
     ESP32_MCPWM_NODISCARD MotorHardwareReadback readback() const noexcept override;
 
     /**
@@ -239,6 +292,13 @@ class HBridgeMotor : public IMotorDriver
      *
      * The method is inert unless ESP32_MCPWM_ENABLE_COMMISSIONING_API is set to 1
      * before compiling the library.
+     * Enabled calls require setup and no fault, but do not start MCPWM or
+     * update the normal output_mode label. Inspect duties and running state
+     * separately during commissioning.
+     *
+     * @param a_high True requests full A duty; false requests zero A duty.
+     * @param b_high True requests full B duty; false requests zero B duty.
+     * @return CommissioningDisabled by default; enabled builds return setup, fault or output-write failures.
      */
     MotorOperationResult forceOutputs(bool a_high, bool b_high) noexcept override;
 
@@ -272,6 +332,8 @@ class HBridgeMotor : public IMotorDriver
     // ---- Result helpers ---- //
 
     /// @brief Build the structured setup result from synchronized driver state.
+    ///
+    /// @return Current setup error and successfully configured optional-fault capability flags.
     MotorSetupResult setupResult() const noexcept;
 
     /**
@@ -343,6 +405,8 @@ class HBridgeMotor : public IMotorDriver
     TimerCommandResult scheduleNextPhase(uint32_t sequence) noexcept;
 
     /// @brief Start dither braking or apply its steady zero/full endpoint.
+    ///
+    /// @return None for an applied endpoint or scheduled phase; otherwise the setup, fault, output or timer error.
     MotorOperationError startSoftBrake() noexcept;
 
     /// @brief Stop dither timing and invalidate all callbacks from older generations.
@@ -360,6 +424,8 @@ class HBridgeMotor : public IMotorDriver
     TimerCommandResult containDitherTimerFailure(uint32_t sequence) noexcept;
 
     /// @brief Recompute brake/coast durations from configured frequency and strength.
+    ///
+    /// @return True after publishing valid phase durations; false for an invalid range or period.
     bool recomputeSoftDurations() noexcept;
 
     // ---- Hardware output helpers ---- //
@@ -412,18 +478,28 @@ class HBridgeMotor : public IMotorDriver
     void IRAM_ATTR faultISR() noexcept;
 
     /// @brief Return whether the configured software-fault GPIO level is active.
+    ///
+    /// @return True when the configured GPIO matches the selected active polarity; caller requires a valid pin.
     bool IRAM_ATTR faultInputActive() const noexcept;
 
     /// @brief Return a synchronized snapshot of active or latched software fault state.
+    ///
+    /// @return True when the synchronized software fault latch is set.
     bool softwareFaultActiveSnapshot() const noexcept;
 
     /// @brief Return a synchronized snapshot of deferred software-fault work.
+    ///
+    /// @return True when ISR-posted fault work awaits task-context polling.
     bool softwareFaultPendingSnapshot() const noexcept;
 
     /// @brief Apply the configured scheduler-dependent software-fault action.
+    ///
+    /// @return None when the configured action succeeds; otherwise its output, stop, start or command error.
     MotorOperationError applyFaultAction() noexcept;
 
     /// @brief Apply the configured explicit full electronic brake for a fault action.
+    ///
+    /// @return None after starting MCPWM and committing full A/B duty; otherwise the hardware error.
     MotorOperationError emergencyBrake() noexcept;
 
     /// @brief Detach the software-fault GPIO interrupt when configured.
@@ -458,15 +534,23 @@ class HBridgeMotor : public IMotorDriver
     void IRAM_ATTR hardwareFaultISR() noexcept;
 
     /// @brief Configure exact MCPWM A/B hardware-fault actions and observation.
+    ///
+    /// @return True when disabled or fully configured; false when routing, initialization or mode setup fails.
     bool configureHardwareFault() noexcept;
 
     /// @brief Re-arm a one-shot hardware fault after quiet output staging.
+    ///
+    /// @return True when no re-arm is needed or it succeeds; false for active input or peripheral API failure.
     bool rearmHardwareFault() noexcept;
 
     /// @brief Detach and deinitialize the MCPWM hardware-fault path.
+    ///
+    /// @return True when no peripheral fault remains configured; false when deinitialization fails.
     bool detachHardwareFault() noexcept;
 
     /// @brief Return whether the configured hardware-fault GPIO level is active.
+    ///
+    /// @return True when the hardware-fault GPIO is high; false when absent or low.
     bool hardwareFaultInputActive() const noexcept;
 
     // ---- Capture ---- //
@@ -487,10 +571,12 @@ class HBridgeMotor : public IMotorDriver
     // ---- Setup / teardown ---- //
 
     /// @brief Tear down previous resources and contain outputs before a setup attempt.
+    ///
+    /// @return None after containment and state reset; ContainmentFailed retains resources for later recovery.
     MotorSetupError prepareForSetup() noexcept;
 
     /**
-     * @brief Validate all setup configuration before touching hardware resources.
+     * @brief Validate pin conflicts and timing ranges within one setup configuration.
      *
      * @param hw MCPWM routing and electrical-interface configuration.
      * @param beh Coast and dither behavior configuration.
@@ -621,8 +707,12 @@ class HBridgeMotor : public IMotorDriver
     MotorOperationError last_operation_error_{MotorOperationError::None}; ///< Primary diagnosis of last operation.
 
     /// @brief Prevent copying an instance that owns timers, interrupts, and MCPWM state.
+    ///
+    /// @param other Source instance; copying hardware-owning drivers is prohibited.
     HBridgeMotor(const HBridgeMotor &other) = delete;
 
     /// @brief Prevent assignment between instances that own hardware resources.
+    ///
+    /// @param other Source instance; copying hardware-owning drivers is prohibited.
     HBridgeMotor &operator=(const HBridgeMotor &other) = delete;
 };

@@ -16,7 +16,7 @@ BreakBeforeBraces: Allman
 AlignTrailingComments: true
 ReflowComments: false
 
-# LMB has an explicit include hierarchy checked separately.
+# Preserve the deliberate public-header/framework include order.
 SortIncludes: false
 
 AllowShortFunctionsOnASingleLine: Empty

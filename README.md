@@ -31,7 +31,7 @@ The library does **not** decide whether a vehicle is safe to move. It is an actu
 - [Testing](#testing)
 - [Physical validation](#physical-validation)
 - [Migration from v1.3](#migration-from-v13)
-- [PW_PVT integration notes](#pw_pvt-integration-notes)
+- [Application integration notes](#application-integration-notes)
 - [Repository structure](#repository-structure)
 - [Limitations](#limitations)
 - [Version](#version)
@@ -128,10 +128,8 @@ The primary project and example target is:
 
 - ESP32-S3 DevKitC-1.
 
-The release compile matrix currently covers:
-
-- ESP32-S3 DevKitC-1;
-- original ESP32 Dev Module.
+The routine CI matrix covers ESP32-S3 DevKitC-1. Original ESP32 Dev Module
+compilation was also recorded for v2.0.0; it is not a separate routine CI gate.
 
 ESP32-S2 and ESP32-C3 are **not** listed as supported targets for this release because the pinned legacy MCPWM API is not available for those targets in this release configuration.
 
@@ -141,7 +139,7 @@ The authoritative v2.0.0 release baseline is:
 - pioarduino Espressif32 55.03.38;
 - Arduino-ESP32 3.3.8.
 
-Both ESP32-S3 and original ESP32 builds use that same pinned platform/framework baseline. A floating/latest build is not release evidence.
+The current ESP32-S3 gate uses that pinned platform/framework baseline. A floating/latest build is not release evidence.
 
 A successful compile does not prove that every peripheral signal can be routed to every physical board pin; check the selected SoC and board documentation.
 
@@ -298,6 +296,10 @@ hardware.input_max = 1023;
 ```
 
 Optional MCPWM dead-time configuration remains available through the same structure.
+Despite their historical `_ns` names, `deadtime_red_ns` and `deadtime_fed_ns`
+are passed unchanged to the legacy MCPWM API as RED/FED counts. They are not
+converted from nanoseconds; the actual delay depends on the MCPWM group
+resolution. Validate the resulting waveform before enabling dead time.
 
 Setup rejects invalid or conflicting pins, duplicate PWM signals, invalid input ranges and invalid drive frequencies before activating the bridge.
 
@@ -485,7 +487,7 @@ Available software actions are:
 - `DisableOutputs`;
 - `HardBrake` — explicit opt-in only.
 
-For one-shot mode, the fault remains latched until the physical input is inactive and `clearFault()` succeeds. For level-follow mode, release returns the driver to a quiet zero-output state; it never restores the previous drive command.
+In one-shot mode, the software observer latches the fault. `clearFault()` rejects an active physical input. Once the input is inactive, it clears the software latch before performing fallible output writes and recovery operations. A failed recovery can therefore leave `hasFault()` false and allow a later drive command. Keep an application-owned drive inhibit until the returned recovery result reports success; `hasFault() == false` alone does not confirm recovery. For level-follow mode, release returns the driver to a quiet zero-output state; it never restores the previous drive command.
 
 ### 2. MCPWM peripheral fault — `MotorHardwareFaultConfig`
 
@@ -682,6 +684,10 @@ unless the library is compiled with:
 ```
 
 The compile-time gate exists because raw output forcing bypasses the normal drive/coast/brake model.
+Enabled calls still require setup and no active fault, but do not start a
+stopped MCPWM timer or update `status().output_mode`. Inspect commanded duty,
+readback and running state separately; the previous normal mode label does
+not describe a raw commissioning request.
 
 Use it only for controlled bench commissioning where directly forcing the two bridge inputs is deliberate and understood.
 
@@ -717,7 +723,9 @@ Measures edge intervals with an ESP32-S3 test signal/jumper.
 
 ### 06_TwoMotors
 
-Uses independent MCPWM timers/channels to control two H-bridges.
+Uses independent MCPWM timers/channels to control two H-bridges. The application
+must assign distinct timers and matching A/B signal pairs; setup does not check
+cross-instance resource conflicts or timer/signal coherence.
 
 The examples remain intentionally small. The README is the technical reference; the examples are there to get working code on a bench quickly.
 
@@ -730,7 +738,7 @@ The repository uses a dedicated `test/` folder rather than the old `platformio.c
 ### Native deterministic suite
 
 ```bash
-./test/run_native_tests.sh
+bash test/run_native_tests.sh
 ```
 
 Runs under C++11 with strict warnings and deterministic Arduino/MCPWM/GPIO/timer mocks.
@@ -777,7 +785,7 @@ The native suite is run with both compilers where available using:
 ### Sanitizers
 
 ```bash
-./test/run_sanitizers.sh
+bash test/run_sanitizers.sh
 ```
 
 Runs AddressSanitizer and UndefinedBehaviorSanitizer on the deterministic suite.
@@ -785,7 +793,7 @@ Runs AddressSanitizer and UndefinedBehaviorSanitizer on the deterministic suite.
 ### ThreadSanitizer
 
 ```bash
-./test/run_tsan.sh
+bash test/run_tsan.sh
 ```
 
 Stresses synchronized ISR/task status and capture state while ThreadSanitizer watches for host-visible data races.
@@ -793,26 +801,30 @@ Stresses synchronized ISR/task status and capture state while ThreadSanitizer wa
 ### Example syntax checks
 
 ```bash
-./test/check_examples_host.sh
+bash test/check_examples_host.sh
 ```
 
 Compiles the public sketch surfaces against lightweight ESP32 host stubs. Real target compilation remains a separate CI gate.
 
-### LMB presentation and release contracts
+### Documentation and release contracts
 
 ```bash
-python3 ./test/check_lmb_style.py
-./test/check_release_contracts.sh
+bash test/check_release_contracts.sh
 ```
 
-The presentation check audits the complete public source/example surface and
-runs deterministic negative probes. The release contract separately verifies
-version/toolchain consistency and the strict Git-aware distribution inventory.
-Semantic documentation quality still receives a manual release review.
+The release contract checks version/toolchain consistency, README sections and
+CI commands. Documentation quality also receives a manual release review.
+
+Run the complete host suite with `sh test/run_host_checks.sh`. It creates a
+deterministic source ZIP, checks the extracted bytes, and runs GNU GCC, Clang,
+sanitizers, example syntax and release checks from the extracted copy with all
+executable bits removed. Set `GCC_CXX` to your genuine GNU C++ compiler and
+`CLANG_CXX` to Clang when their command names differ from `g++` and `clang++`;
+on macOS, `g++` is commonly an alias for Clang.
 
 ### Target CI
 
-GitHub Actions installs PlatformIO Core 6.1.19 and contains pinned pioarduino Espressif32 55.03.38 / Arduino-ESP32 3.3.8 compile gates for the ESP32-S3/original-ESP32 targets and the public ESP32-S3 examples.
+GitHub Actions installs PlatformIO Core 6.1.19 and contains pinned pioarduino Espressif32 55.03.38 / Arduino-ESP32 3.3.8 library compile gates using `pio ci --project-conf platformio.ini --lib=.` for the ESP32-S3 smoke sketch and every public example.
 
 Local host tests are **not** a substitute for those target compiler gates.
 
@@ -960,9 +972,9 @@ Default setup overloads delegate only when additional behavior/fault/capture con
 
 ---
 
-## PW_PVT integration notes
+## Application integration notes
 
-PW_PVT currently uses ESP32_MCPWM through a motor adapter. v2 intentionally remains independent of the project, but the later PW_PVT update should use the stronger operation results and diagnostics.
+Applications that wrap ESP32_MCPWM in a motor adapter should use its operation results and diagnostics to track confirmed lifecycle transitions.
 
 ### Operation results
 
@@ -977,9 +989,7 @@ use the returned `MotorOperationResult` to decide whether the adapter is actuall
 
 ### Reversal dither
 
-The current project uses a zero speed request to enter its configured dither state during reversal handling.
-
-That v1 behavior is intentionally removed. The later PW_PVT migration should use:
+Applications migrating from v1 zero-speed reversal dither should now request the intended output action explicitly:
 
 ```cpp
 motor.softBrakeNow(reversal_dither_pwm);
@@ -989,7 +999,7 @@ or another explicit project-selected output action.
 
 ### Fault architecture
 
-PW_PVT should not treat the software `pollFaults()` path as its sole emergency containment. The project-level SafetyCore and independent hardware stop/bridge-disable design remain responsible for final propulsion safety.
+An application must not treat the software `pollFaults()` path as its sole emergency containment. Application-level safety coordination and independent hardware stop/bridge-disable design remain responsible for final propulsion safety.
 
 ### Readback
 
@@ -1000,9 +1010,7 @@ status()
 readback()
 ```
 
-to improve StartupSupervisor/SafetyCore diagnostics and avoid setting local lifecycle flags after an unverified operation.
-
-No PW_PVT source is modified by this library release.
+to improve startup and fault diagnostics and avoid setting local lifecycle flags after an unverified operation.
 
 ---
 
@@ -1057,20 +1065,18 @@ ESP32_MCPWM/
 
 ## Version history
 
-Current release:
+Current version:
 
 ```text
 2.0.0
 ```
 
-This is a **major** release because zero-drive behavior and the default fault action intentionally change, structured operation results are added to the driver interface, and raw output forcing is gated.
-
-See [CHANGELOG.md](CHANGELOG.md) for the release history.
+See [CHANGELOG.md](CHANGELOG.md) for detailed release history.
 
 ---
 
 ## License
 
-MIT License. See [LICENSE](LICENSE).
+ESP32_MCPWM is released under the **MIT License**. See [LICENSE](LICENSE).
 
-Copyright (c) 2026 Little Man Builds.
+Copyright © 2026 Little Man Builds (Darren Osborne).

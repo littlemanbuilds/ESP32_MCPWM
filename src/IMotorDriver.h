@@ -40,6 +40,10 @@
 
 /**
  * @brief Hardware configuration for an MCPWM-driven H-bridge motor.
+ *
+ * The application must choose the A/B signal pair matching the timer and keep
+ * its MCPWM resources exclusive. HBridgeMotor does not validate timer/signal
+ * coherence or reserve resources against other instances or peripheral users.
  */
 struct MotorMCPWMConfig
 {
@@ -58,8 +62,8 @@ struct MotorMCPWMConfig
 
     bool use_deadtime = false;                                               ///< Enable MCPWM dead-time insertion.
     mcpwm_deadtime_type_t deadtime_type = MCPWM_ACTIVE_HIGH_COMPLIMENT_MODE; ///< Dead-time mode.
-    uint32_t deadtime_red_ns = 500;                                          ///< Rising-edge delay in ns.
-    uint32_t deadtime_fed_ns = 500;                                          ///< Falling-edge delay in ns.
+    uint32_t deadtime_red_ns = 500;                                          ///< Legacy RED count passed unchanged; suffix retained for compatibility.
+    uint32_t deadtime_fed_ns = 500;                                          ///< Legacy FED count passed unchanged; suffix retained for compatibility.
 
     /// @brief Construct an unassigned hardware configuration.
     MotorMCPWMConfig() = default;
@@ -157,12 +161,16 @@ struct MotorSetupResult
     }
 
     /// @brief Return true when setup completed successfully.
+    ///
+    /// @return True when error is None; false when a failure is recorded.
     ESP32_MCPWM_NODISCARD bool ok() const noexcept
     {
         return error == MotorSetupError::None;
     }
 
     /// @brief Convert the result to true when setup completed successfully.
+    ///
+    /// @return True when error is None; false otherwise.
     operator bool() const noexcept
     {
         return ok();
@@ -234,12 +242,16 @@ struct MotorOperationResult
     }
 
     /// @brief Return true when the requested operation completed without error.
+    ///
+    /// @return True when error is None; false when a failure is recorded.
     ESP32_MCPWM_NODISCARD bool ok() const noexcept
     {
         return error == MotorOperationError::None;
     }
 
     /// @brief Convert the result to true when the operation completed without error.
+    ///
+    /// @return True when error is None; false otherwise.
     operator bool() const noexcept
     {
         return ok();
@@ -560,9 +572,13 @@ class IMotorDriver
     }
 
     /// @brief Return whether setup completed successfully.
+    ///
+    /// @return Driver's retained setup-complete state; a failed replacement teardown may preserve an earlier setup.
     ESP32_MCPWM_NODISCARD virtual bool isSetupComplete() const noexcept = 0;
 
     /// @brief Return the most recent setup error.
+    ///
+    /// @return Most recent setup or containment error, or None when no setup error is recorded.
     ESP32_MCPWM_NODISCARD virtual MotorSetupError getLastSetupError() const noexcept = 0;
 
     /**
@@ -588,6 +604,10 @@ class IMotorDriver
      *
      * v2 rejects zero because a numeric drive request no longer chooses a physical
      * stop mode. Use coast(), stop(), setHardBrake(), or softBrakeNow() explicitly.
+     *
+     * @param speed Positive logical drive demand; HBridgeMotor clamps values above getMaxPwmInput().
+     * @param dir Requested motor direction.
+     * @return Drive result; nonpositive demand is rejected as InvalidCommand.
      */
     virtual MotorOperationResult setSpeed(int speed, Dir dir) noexcept
     {
@@ -596,6 +616,10 @@ class IMotorDriver
     }
 
     /// @brief Compatibility percentage API; zero is rejected in v2.
+    ///
+    /// @param percent Positive drive percentage; HBridgeMotor clamps finite values above 100.
+    /// @param dir Requested motor direction.
+    /// @return Drive result; nonpositive or nonfinite demand is rejected by HBridgeMotor.
     virtual MotorOperationResult setSpeedPercent(float percent, Dir dir) noexcept
     {
         return (percent <= 0.0f)
@@ -604,6 +628,8 @@ class IMotorDriver
     }
 
     /// @brief Enter the configured explicit coast/freewheel state.
+    ///
+    /// @return Coast result, including setup, fault, output-write or dither failures.
     virtual MotorOperationResult coast() noexcept = 0;
 
     /**
@@ -617,15 +643,22 @@ class IMotorDriver
     }
 
     /// @brief Compatibility alias for coast().
+    ///
+    /// @return Result of the explicit configured coast request.
     virtual MotorOperationResult setFreewheel() noexcept
     {
         return coast();
     }
 
     /// @brief Apply an explicit, hardware-validated full electronic brake.
+    ///
+    /// @return Brake result; failure means the requested brake state was not established.
     virtual MotorOperationResult setHardBrake() noexcept = 0;
 
     /// @brief Configure the soft-brake PWM level without implicitly starting it.
+    ///
+    /// @param pwm Logical brake level, clamped by HBridgeMotor to [0, getMaxPwmInput()].
+    /// @return Unsupported in the base implementation; concrete drivers may configure braking.
     virtual MotorOperationResult setSoftBrakePWM(uint16_t pwm) noexcept
     {
         (void)pwm;
@@ -633,12 +666,16 @@ class IMotorDriver
     }
 
     /// @brief Process deferred software-fault state in task context.
+    ///
+    /// @return Unsupported in the base implementation; concrete drivers may process deferred faults.
     virtual MotorOperationResult pollFaults() noexcept
     {
         return {MotorOperation::PollFaults, MotorOperationError::Unsupported, false, 0};
     }
 
     /// @brief Return the maximum accepted logical drive input.
+    ///
+    /// @return Configured positive upper bound for logical drive demand.
     ESP32_MCPWM_NODISCARD virtual int getMaxPwmInput() const noexcept = 0;
 
     /**
@@ -666,9 +703,13 @@ class IMotorDriver
     }
 
     /// @brief Start the driver's output-generation lifecycle.
+    ///
+    /// @return Lifecycle result; success establishes configured coast/dither, never restores prior drive.
     virtual MotorOperationResult start() noexcept = 0;
 
     /// @brief Stop and contain the driver's output-generation lifecycle.
+    ///
+    /// @return Lifecycle result; success means zero duty was written and MCPWM was stopped.
     virtual MotorOperationResult stop() noexcept = 0;
 
     /**
@@ -684,24 +725,32 @@ class IMotorDriver
     }
 
     /// @brief Return the latest captured edge interval, or zero when unsupported/unavailable.
+    ///
+    /// @return Zero in the base implementation; concrete drivers return the selected-edge interval in microseconds.
     ESP32_MCPWM_NODISCARD virtual uint32_t getLastCapturePeriodUs() const noexcept
     {
         return 0;
     }
 
     /// @brief Return whether any driver fault state is active or latched.
+    ///
+    /// @return False in the base implementation; concrete drivers report active or latched faults.
     ESP32_MCPWM_NODISCARD virtual bool hasFault() const noexcept
     {
         return false;
     }
 
     /// @brief Return whether the concrete driver owns an independent EN control.
+    ///
+    /// @return False in the base implementation; concrete drivers report EN capability.
     ESP32_MCPWM_NODISCARD virtual bool hasEnableControl() const noexcept
     {
         return false;
     }
 
     /// @brief Clear inactive fault state when the concrete driver supports recovery.
+    ///
+    /// @return Unsupported in the base implementation; concrete drivers define fault recovery.
     virtual MotorOperationResult clearFault() noexcept
     {
         return {MotorOperation::ClearFault, MotorOperationError::Unsupported, false, 0};
@@ -712,6 +761,10 @@ class IMotorDriver
      *
      * Concrete drivers should reject this unless their explicit commissioning
      * build option is enabled.
+     *
+     * @param a_high True requests full A duty; false requests zero A duty.
+     * @param b_high True requests full B duty; false requests zero B duty.
+     * @return CommissioningDisabled by default; enabled builds return setup, fault or output-write failures.
      */
     virtual MotorOperationResult forceOutputs(bool a_high, bool b_high) noexcept
     {
@@ -733,12 +786,16 @@ class IMotorDriver
     }
 
     /// @brief Return a coherent software status snapshot when supported.
+    ///
+    /// @return Default empty snapshot in the base implementation; concrete drivers supply synchronized state.
     ESP32_MCPWM_NODISCARD virtual MotorDriverStatus status() const noexcept
     {
         return {};
     }
 
     /// @brief Return available direct hardware/API readback when supported.
+    ///
+    /// @return Invalid empty readback in the base implementation; concrete drivers supply available readings.
     ESP32_MCPWM_NODISCARD virtual MotorHardwareReadback readback() const noexcept
     {
         return {};

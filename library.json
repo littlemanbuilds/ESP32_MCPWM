@@ -43,5 +43,8 @@
     "examples/04_RuntimeFrequencyChange/04_RuntimeFrequencyChange.ino",
     "examples/05_CaptureInput/05_CaptureInput.ino",
     "examples/06_TwoMotors/06_TwoMotors.ino"
+  ],
+  "headers": [
+    "ESP32_MCPWM.h"
   ]
 }

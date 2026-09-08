@@ -7,7 +7,7 @@ The test folder separates host-verifiable software behavior from target and phys
 Run:
 
 ```bash
-./test/run_native_tests.sh
+bash test/run_native_tests.sh
 ```
 
 The suite builds as C++11 with strict warnings. It uses deterministic Arduino, GPIO, MCPWM and `esp_timer` mocks and covers setup/containment, physical output ordering, custom-driver interface truthfulness, explicit drive/coast/brake behavior, literal changed semantics, lifecycle failures, software faults, MCPWM hardware-fault configuration, dither failure containment, capture, readback and commissioning API gating.
@@ -17,8 +17,8 @@ The same script also runs a synchronized ISR/task concurrency stress case.
 ## Sanitizers
 
 ```bash
-./test/run_sanitizers.sh
-./test/run_tsan.sh
+bash test/run_sanitizers.sh
+bash test/run_tsan.sh
 ```
 
 AddressSanitizer/UndefinedBehaviorSanitizer exercise the deterministic suite. ThreadSanitizer exercises the shared ISR/task status behavior with a mutex-backed host equivalent of the ESP32 critical section.
@@ -26,7 +26,7 @@ AddressSanitizer/UndefinedBehaviorSanitizer exercise the deterministic suite. Th
 ## Public examples
 
 ```bash
-./test/check_examples_host.sh
+bash test/check_examples_host.sh
 ```
 
 This is a strict host syntax gate only. It does not emulate MCPWM silicon.
@@ -34,19 +34,19 @@ This is a strict host syntax gate only. It does not emulate MCPWM silicon.
 ## Release checks
 
 ```bash
-./test/check_release_contracts.sh
+bash test/check_release_contracts.sh
 ```
 
-The style gate audits all public source/example files and proves representative
-failures are rejected with deterministic negative probes. The release script
-also runs that gate, then checks version agreement, standard README sections,
-required examples, pinned toolchain contracts, strict Git-aware candidate
-inventory and protected/private-content rejection. Ignored local developer
-artifacts do not fail this check.
+The release script checks version agreement, README sections, public examples,
+pinned PlatformIO configuration and CI commands. Run the aggregate suite with
+`sh test/run_host_checks.sh` to verify a deterministic source ZIP: the extracted
+copy has no executable bits and runs the native, sanitizer, concurrency, example
+and release checks. `GCC_CXX` and `CLANG_CXX` select genuine GNU GCC and Clang;
+Apple's `g++` alias cannot substitute for the GNU GCC gate.
 
 ## Target compile
 
-GitHub Actions contains PlatformIO compile gates for verified ESP32-S3/original-ESP32 boards and public ESP32-S3 examples.
+GitHub Actions contains PlatformIO compile gates for the ESP32-S3 reference board and every public ESP32-S3 example using `pio ci --project-conf platformio.ini --lib=.`.
 
 ## Evidence boundary
 
@@ -63,6 +63,6 @@ No host test proves:
 
 Those remain physical validation gates.
 
-## LMB presentation conformance
+## Repository validation
 
-LMB presentation rules are checked by the installed fleet conformance harness rather than duplicated in this repository. Repository tests remain focused on library-specific behaviour, compatibility, release metadata, and examples.
+Documentation and style rules are checked during release validation rather than duplicated in repository-specific test code. Repository tests remain focused on library-specific behaviour, compatibility, release metadata, and examples.

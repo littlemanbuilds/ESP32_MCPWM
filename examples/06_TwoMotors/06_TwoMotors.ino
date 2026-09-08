@@ -25,8 +25,8 @@ MotorMCPWMConfig right_hardware{9, 10, 11, MCPWM_UNIT_0, MCPWM_TIMER_1, MCPWM1A,
 Motor left_motor;
 Motor right_motor;
 
-static constexpr Dir LEFT_FORWARD = Dir::CW;
-static constexpr Dir RIGHT_FORWARD = Dir::CW;
+const Dir LEFT_FORWARD = Dir::CW;
+const Dir RIGHT_FORWARD = Dir::CW;
 
 // ---- Helpers ---- //
 

@@ -3,6 +3,7 @@
  *
  * @file compile_smoke.ino
  * @brief Small target-compile gate for the public ESP32_MCPWM surface.
+ *
  * @author Little Man Builds (Darren Osborne)
  * @date 2026-08-07
  * @copyright Copyright (c) 2026 Little Man Builds

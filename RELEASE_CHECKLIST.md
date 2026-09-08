@@ -25,34 +25,34 @@ Use this checklist before publishing an ESP32_MCPWM release.
 
 ## Documentation and examples
 
-- [x] README follows the standard LMB introduction / contents / installation / beginner path / technical reference / testing / migration flow.
+- [x] README follows the introduction / contents / installation / beginner path / technical reference / testing / migration flow.
 - [x] README has a dedicated physical-validation section and clear evidence boundary.
-- [x] All source and example files use the LMB Doxygen file-header style.
-- [x] Public/private method and member Doxygen coverage passes the repository LMB presentation gate.
+- [x] All source and example files use Doxygen file headers.
+- [x] Public/private function contracts describe parameters, returns and safety boundaries.
 - [x] Historical v1.3 Doxygen/provenance and the complete public source/example surface were reviewed.
 - [x] Existing six-example progression is retained.
 - [x] Example GPIO choices remain appropriate for the ESP32-S3 DevKitC-1 teaching target.
 - [x] Fault example explicitly identifies `pollFaults()` as software-deferred containment.
 - [x] `keywords.txt` and package metadata match the v2 public API.
 
-## Automated validation performed locally
+## Automated validation for the next package
 
-- [ ] Native C++11 deterministic suite with real GNU GCC (not installed on this local macOS host).
-- [x] Native C++11 deterministic suite with Clang.
-- [x] Strict warnings: `-Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Wshadow -Werror`.
-- [x] AddressSanitizer + UndefinedBehaviorSanitizer.
-- [x] ThreadSanitizer ISR/task shared-state stress.
-- [x] Commissioning API tested both disabled and explicitly enabled.
-- [x] Strict host syntax compile of all public examples.
-- [x] Repository-owned LMB style gate and all representative negative probes.
-- [x] Pinned PlatformIO 6.1.19 compile smoke passed for ESP32-S3 DevKitC-1 and original ESP32 Dev Module.
-- [x] Pinned PlatformIO compile passed for all six public examples on ESP32-S3 DevKitC-1.
-- [x] Release/package-hygiene checks.
+- [ ] Native C++11 deterministic suite with genuine GNU GCC.
+- [ ] Native C++11 deterministic suite with Clang.
+- [ ] Strict warnings: `-Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Wshadow -Werror`.
+- [ ] AddressSanitizer + UndefinedBehaviorSanitizer.
+- [ ] ThreadSanitizer ISR/task shared-state stress.
+- [ ] Commissioning API tested both disabled and explicitly enabled.
+- [ ] Strict host syntax compile of all public examples.
+- [ ] Documentation/style checks and source ZIP validation.
+- [ ] Pinned PlatformIO 6.1.19 compile smoke for ESP32-S3 DevKitC-1.
+- [ ] Pinned PlatformIO compile for all six public examples on ESP32-S3 DevKitC-1.
+- [ ] Release/package-hygiene checks.
 - [ ] Final release ZIP unpacked and retested from a clean directory.
 
 ## Remote CI / hardware gates
 
-- [ ] GitHub Actions ESP32-S3/original-ESP32 PlatformIO matrix completed remotely.
+- [ ] GitHub Actions ESP32-S3 PlatformIO gate completed remotely.
 - [ ] ESP32-S3 public examples completed remotely in GitHub Actions.
 - [ ] Physical ESP32-S3 drive/coast/disable output truth table validated.
 - [ ] Physical EN sequencing validated with an oscilloscope.

@@ -46,8 +46,11 @@ grep -Eq '^lib_dir = \.\.$' "$ROOT/platformio.ini" || fail "PlatformIO run must 
 [[ "$(grep -c '^\[env:esp32-s3-devkitc-1\]$' "$ROOT/platformio.ini")" == "1" ]] || fail "ESP32-S3 reference environment missing"
 ! grep -Fq '[env:esp32dev]' "$ROOT/platformio.ini" || fail "redundant classic ESP32 environment should not be in the routine matrix"
 grep -Fq 'platformio==6.1.19' "$ROOT/.github/workflows/ci.yml" || fail "CI must pin PlatformIO Core 6.1.19"
+grep -Fq 'pio ci --project-conf platformio.ini --lib=.' "$ROOT/.github/workflows/ci.yml" || fail "CI must compile this library through pio ci"
+! grep -Eq 'lib_extra_dirs|PLATFORMIO_SRC_DIR' "$ROOT/platformio.ini" "$ROOT/.github/workflows/ci.yml" || fail "obsolete source/library redirection"
+grep -Fq 'sh test/run_host_checks.sh' "$ROOT/.github/workflows/ci.yml" || fail "CI must run the complete host and distribution checks"
 
-if find "$ROOT/src" "$ROOT/examples" "$ROOT/test" -type f \( -name '*.o' -o -name '*.elf' -o -name '*.bin' -o -name '*.map' -o -name '*.zip' \) -print -quit | grep -q .; then
+if find "$ROOT/src" "$ROOT/examples" "$ROOT/test" -path "$ROOT/test/build" -prune -o -type f \( -name '*.o' -o -name '*.elf' -o -name '*.bin' -o -name '*.map' -o -name '*.zip' \) -print | grep -q .; then
   fail "build/archive artefact found in public product tree"
 fi
 

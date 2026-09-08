@@ -128,6 +128,9 @@ MotorSetupResult HBridgeMotor::setup(const MotorMCPWMConfig &hw, const MotorBeha
         return setupResult();
     }
 
+    // Initialize both compare channels at zero before enabling optional paths.
+    // Routing and timer selection are separate legacy API calls: the caller
+    // must supply the A/B signal pair belonging to this timer.
     mcpwm_config_t cfg{};
     cfg.frequency = pwm_freq_hz_;
     cfg.cmpr_a = 0.0f;
@@ -323,6 +326,8 @@ MotorOperationResult HBridgeMotor::setSpeedPercent(float percent, Dir dir) noexc
 
 MotorOperationResult HBridgeMotor::coast() noexcept
 {
+    // Coast follows the configured electrical policy; DitherBrake deliberately
+    // alternates braking and coast rather than treating zero drive as a stop.
     if (!isSetupComplete())
         return reject(MotorOperation::Coast, MotorOperationError::NotSetup);
     if (hasFault())
@@ -662,6 +667,8 @@ MotorOperationResult HBridgeMotor::applyFreewheel(FreewheelMode mode) noexcept
 
 MotorOperationResult HBridgeMotor::start() noexcept
 {
+    // Stage zero duty with EN low before restarting the generator so a prior
+    // drive compare value is not intentionally restored by this lifecycle call.
     if (!isSetupComplete())
         return reject(MotorOperation::Start, MotorOperationError::NotSetup);
     if (hasFault())
@@ -747,6 +754,8 @@ MotorOperationResult HBridgeMotor::stop() noexcept
 
 MotorOperationResult HBridgeMotor::reconfigureFrequency(int new_hz) noexcept
 {
+    // Preserve fault containment while changing frequency. Outside a fault,
+    // quiet the outputs first and restart only previously active dither.
     if (!isSetupComplete())
         return reject(MotorOperation::ReconfigureFrequency, MotorOperationError::NotSetup);
     if (new_hz < kPwmHzMin || new_hz > kPwmHzMax)
@@ -1018,6 +1027,8 @@ HBridgeMotor::TimerCommandResult HBridgeMotor::scheduleNextPhase(uint32_t sequen
 
 MotorOperationError HBridgeMotor::startSoftBrake() noexcept
 {
+    // Zero/full strength are steady endpoints, not zero-duration timer phases.
+    // Intermediate strength starts in coast before scheduling the first brake.
     if (!isSetupComplete())
         return MotorOperationError::NotSetup;
     if (hasFault())
@@ -1146,6 +1157,8 @@ bool HBridgeMotor::recomputeSoftDurations() noexcept
     }
     else if (pwm > 0U)
     {
+        // Widen the product before rounding; reserve a nonzero coast phase
+        // even when the requested minimum exceeds half of the period.
         brake_us =
             static_cast<int64_t>((static_cast<uint64_t>(period_us) * pwm + static_cast<uint32_t>(input_max_ / 2)) /
                                  static_cast<uint32_t>(input_max_));
@@ -1457,6 +1470,8 @@ void HBridgeMotor::hardwareFaultISR() noexcept
 
 bool HBridgeMotor::configureHardwareFault() noexcept
 {
+    // Peripheral actions must be installed before attaching the diagnostic ISR.
+    // The ISR observes the fault; MCPWM enforces the configured A/B levels.
     if (hardware_fault_.mode == HardwareFaultMode::Disabled)
         return true;
 
@@ -1621,6 +1636,8 @@ void HBridgeMotor::detachCaptureInterrupt() noexcept
 
 MotorSetupError HBridgeMotor::prepareForSetup() noexcept
 {
+    // Keep the old resource identity until every containment step succeeds;
+    // clearing it early would prevent a later attempt from retrying teardown.
     stopSoftBrake();
 
     bool zeroed = true;
@@ -1719,6 +1736,9 @@ MotorSetupError HBridgeMotor::validateConfig(const MotorMCPWMConfig &hw, const M
                                              const MotorSafetyConfig &safety, const MotorCaptureConfig &cap,
                                              const MotorHardwareFaultConfig &hardware_fault) const noexcept
 {
+    // These checks cover pin conflicts within this configuration and timing
+    // ranges. Matching timer/signals and exclusive peripheral use remain the
+    // application's responsibility; there is no cross-instance registry.
     if (!GPIO_IS_VALID_OUTPUT_GPIO(hw.lpwm_pin) || !GPIO_IS_VALID_OUTPUT_GPIO(hw.rpwm_pin))
         return MotorSetupError::InvalidPwmPin;
     if (hw.lpwm_pin == hw.rpwm_pin)
@@ -1771,6 +1791,8 @@ MotorSetupError HBridgeMotor::validateConfig(const MotorMCPWMConfig &hw, const M
 
 void HBridgeMotor::failSetup(MotorSetupError error) noexcept
 {
+    // Teardown errors outrank the initiating setup error: callers must know
+    // whether partially initialized hardware still needs containment.
     detachFaultInterrupt();
     detachCaptureInterrupt();
     const bool hardware_fault_detached = detachHardwareFault();
