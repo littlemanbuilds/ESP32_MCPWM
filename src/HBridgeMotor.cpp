@@ -13,6 +13,11 @@
 #include "HBridgeMotor.h"
 
 #include <driver/gpio.h>
+#include <esp_rom_gpio.h>
+#include <soc/gpio_sig_map.h>
+#include <soc/mcpwm_reg.h>
+#include <soc/soc.h>
+#include <soc/soc_caps.h>
 
 #include <cmath>
 
@@ -30,23 +35,224 @@ template <typename T> static inline T clampValue(T value, T low, T high)
     return (value < low) ? low : (value > high) ? high : value;
 }
 
+namespace
+{
+constexpr uint32_t edge_timer_hz = 1000000U;
+// At 20 kHz this gives 50 ticks per half cycle, retaining 2-point duty resolution.
+// Both supported targets divide the default 10 MHz group clock by five exactly.
+constexpr uint32_t center_timer_hz = 2000000U;
+// Initialize the SDK's module with a small nondegenerate period while the pins
+// are isolated. Changing the cached resolution before init also writes an
+// unclocked peripheral on first use in this SDK, so start with its preset clock.
+constexpr uint32_t bootstrap_hz = edge_timer_hz / 64U;
+// At the selected clocks even the largest register period lasts at most 65,536 us.
+// The extra time allows synchronization and polling overhead, never proves a stop.
+constexpr uint32_t timer_event_timeout_us = 70000U;
+
+/// @brief Read the owned timer's programmed period register.
+uint32_t timerPeriod(mcpwm_unit_t unit, mcpwm_timer_t timer)
+{
+    const uint32_t stride = MCPWM_TIMER1_CFG0_REG(unit) - MCPWM_TIMER0_CFG0_REG(unit);
+    const uint32_t config = REG_READ(MCPWM_TIMER0_CFG0_REG(unit) + static_cast<uint32_t>(timer) * stride);
+    return (config & MCPWM_TIMER0_PERIOD_M) >> MCPWM_TIMER0_PERIOD_S;
+}
+
+/// @brief Wait for the selected raw event without taking a driver lock.
+bool waitForTimerEvent(mcpwm_unit_t unit, uint32_t mask)
+{
+    const uint32_t started = static_cast<uint32_t>(micros());
+    while ((REG_READ(MCPWM_INT_RAW_REG(unit)) & mask) == 0U)
+    {
+        const uint32_t elapsed = static_cast<uint32_t>(micros()) - started;
+        if (elapsed >= timer_event_timeout_us)
+            return false;
+        if (elapsed < 200U)
+            delayMicroseconds(10);
+        else
+            delay(1);
+    }
+    return true;
+}
+
+/// @brief Return the resolution required for a drive counter mode.
+///
+/// @param mode Selected legacy MCPWM mode.
+/// @return Timer clock in Hz after the timer divider.
+uint32_t timerResolution(mcpwm_counter_type_t mode)
+{
+    return mode == MCPWM_UP_DOWN_COUNTER ? center_timer_hz : edge_timer_hz;
+}
+
+/// @brief Translate physical PWM frequency into the legacy timer API argument.
+///
+/// @param mode Selected legacy MCPWM mode.
+/// @param requested_hz Desired GPIO waveform frequency in Hz.
+/// @return Legacy frequency argument, or zero if outside the usable timer range.
+uint32_t legacyFrequency(mcpwm_counter_type_t mode, int requested_hz)
+{
+    if (requested_hz <= 0)
+        return 0;
+    const auto hz = static_cast<uint32_t>(requested_hz);
+    const bool centered = mode == MCPWM_UP_DOWN_COUNTER;
+    if ((!centered && mode != MCPWM_UP_COUNTER && mode != MCPWM_DOWN_COUNTER) ||
+        hz < 16U || hz > 500000U)
+        return 0;
+
+    // Use P+1 for edge cycles and P for a centered half cycle. The legacy
+    // argument can encode only divisors of the form floor(clock / argument).
+    const uint32_t clock = timerResolution(mode);
+    const uint32_t rate = centered ? 2U * hz : hz;
+    const uint32_t offset = centered ? 1U : 0U;
+    const uint32_t target = (clock + rate - 1U) / rate;
+    const uint32_t slower_arg = clock / (target + offset);
+    const uint32_t slower = clock / slower_arg - offset;
+    const uint32_t slower_error = slower * rate - clock;
+    if (slower_error == 0U)
+        return slower_arg;
+
+    const uint32_t faster_arg = slower_arg + 1U;
+    const uint32_t faster = clock / faster_arg - offset;
+    if (slower + offset > UINT16_MAX + 1U)
+        return faster_arg;
+    const uint32_t faster_error = clock - faster * rate;
+    return static_cast<uint64_t>(slower_error) * faster <= static_cast<uint64_t>(faster_error) * slower
+               ? slower_arg
+               : faster_arg;
+}
+
+/// @brief Select the comparator command for the generator's waveform.
+float comparatorDuty(mcpwm_counter_type_t mode, uint32_t period, float duty)
+{
+    if (duty >= 100.0f)
+        return duty;
+    if (mode == MCPWM_UP_DOWN_COUNTER)
+    {
+        // The compare at the turn-around peak is direction-sensitive. Keep
+        // fractional commands below it; full duty uses the no-match bin.
+        const float upper_bin = 100.0f * (static_cast<float>(period) - 0.5f) /
+                                static_cast<float>(period + 1U);
+        return (static_cast<float>(period + 1U) * duty / 100.0f < static_cast<float>(period))
+                   ? duty : upper_bin;
+    }
+    if (mode != MCPWM_DOWN_COUNTER)
+        return duty;
+    // In down mode the generator goes high at peak and low on compare.
+    // A compare at peak wins over the peak action and produces true zero.
+    const auto high = static_cast<uint32_t>(static_cast<float>(period + 1U) * duty / 100.0f);
+    const uint32_t compare = period - high;
+    // Encode a point inside the intended integer bin, away from truncation.
+    return 100.0f * (static_cast<float>(compare) + 0.5f) / static_cast<float>(period + 1U);
+}
+
+/// @brief Decode the legacy comparator ratio into generator duty.
+float generatorDuty(mcpwm_counter_type_t mode, uint32_t period, float compare)
+{
+    const float sdk_ticks = static_cast<float>(period + 1U);
+    if (mode == MCPWM_DOWN_COUNTER)
+    {
+        if (compare >= 100.0f)
+            return 100.0f;
+        const float ticks = std::round(compare * sdk_ticks / 100.0f);
+        return 100.0f * (static_cast<float>(period) - ticks) / sdk_ticks;
+    }
+    if (mode == MCPWM_UP_DOWN_COUNTER && period != 0U)
+        return clampValue(compare * sdk_ticks / static_cast<float>(period), 0.0f, 100.0f);
+    return compare;
+}
+
+// Value-only reservations survive a failed destructor without dangling owners.
+struct ResourceReservation
+{
+    bool occupied = false;
+    bool whole_unit = false;
+    int pins[6] = {-1, -1, -1, -1, -1, -1};
+};
+portMUX_TYPE resource_mux = portMUX_INITIALIZER_UNLOCKED;
+ResourceReservation reservations[SOC_MCPWM_GROUPS][SOC_MCPWM_TIMERS_PER_GROUP];
+}
+
+bool HBridgeMotor::acquireResources(const MotorMCPWMConfig &hw, const MotorSafetyConfig &safety,
+                                    const MotorCaptureConfig &cap, const MotorHardwareFaultConfig &fault) noexcept
+{
+    const bool whole_unit = fault.mode != HardwareFaultMode::Disabled;
+    const int pins[] = {hw.lpwm_pin, hw.rpwm_pin, hw.en_pin, safety.fault_gpio, cap.cap_gpio, fault.fault_gpio};
+    // Registry lock never nests with an instance lock or spans peripheral calls.
+    portENTER_CRITICAL(&resource_mux);
+    for (int unit = 0; unit < SOC_MCPWM_GROUPS; ++unit)
+    {
+        for (int timer = 0; timer < SOC_MCPWM_TIMERS_PER_GROUP; ++timer)
+        {
+            const ResourceReservation &entry = reservations[unit][timer];
+            if (!entry.occupied)
+                continue;
+            bool conflict = unit == hw.unit && (timer == hw.timer || whole_unit || entry.whole_unit);
+            for (int pin : pins)
+                for (int reserved : entry.pins)
+                    conflict = conflict || (pin >= 0 && pin == reserved);
+            if (conflict)
+            {
+                portEXIT_CRITICAL(&resource_mux);
+                return false;
+            }
+        }
+    }
+    ResourceReservation &entry = reservations[hw.unit][hw.timer];
+    entry.occupied = true;
+    entry.whole_unit = whole_unit;
+    for (int i = 0; i < 6; ++i)
+        entry.pins[i] = pins[i];
+    resources_owned_ = true;
+    portEXIT_CRITICAL(&resource_mux);
+    return true;
+}
+
+bool HBridgeMotor::releaseResources() noexcept
+{
+    if (!resources_owned_)
+        return true;
+    if (mcpwm_running_)
+        return false;
+    if (!pwm_isolated_ && !isolatePwm())
+        return false;
+
+    // Hand off the isolated pads without driving them or pulling them high.
+    // Keep EN driven low until both PWM pads have been handed off.
+    gpio_config_t released{};
+    released.pin_bit_mask = (UINT64_C(1) << static_cast<uint32_t>(lpwm_pin_)) |
+                            (UINT64_C(1) << static_cast<uint32_t>(rpwm_pin_));
+    released.mode = GPIO_MODE_INPUT;
+    released.pull_up_en = GPIO_PULLUP_DISABLE;
+    released.pull_down_en = GPIO_PULLDOWN_ENABLE;
+    if (gpio_config(&released) != ESP_OK)
+    {
+        (void)isolatePwm();
+        return false;
+    }
+    if (use_en_)
+    {
+        released.pin_bit_mask = UINT64_C(1) << static_cast<uint32_t>(en_pin_);
+        if (gpio_config(&released) != ESP_OK)
+        {
+            (void)isolatePwm();
+            return false;
+        }
+    }
+    portENTER_CRITICAL(&resource_mux);
+    reservations[mcpwm_unit_][mcpwm_timer_] = ResourceReservation{};
+    resources_owned_ = false;
+    portEXIT_CRITICAL(&resource_mux);
+    return true;
+}
+
 HBridgeMotor::~HBridgeMotor() noexcept
 {
-    // Best effort only: the destructor cannot report MCPWM API failures. An
-    // independent EN path is the only containment guarantee when duty/stop
-    // calls themselves fail during destruction.
+    // Failed teardown retains a value-only quarantine until reboot. Detach
+    // callbacks even on failure so the registry never outlives object storage.
+    (void)prepareForSetup();
     detachFaultInterrupt();
     detachCaptureInterrupt();
-    (void)detachHardwareFault();
-    stopSoftBrake();
-
-    if (setup_done_ || mcpwm_initialized_)
-    {
-        (void)commandOutput(false, 0.0f, 0.0f);
-        if (deadtime_enabled_)
-            (void)mcpwm_deadtime_disable(mcpwm_unit_, mcpwm_timer_);
-        (void)mcpwm_stop(mcpwm_unit_, mcpwm_timer_);
-    }
+    if (hardware_fault_irq_pin_ >= 0)
+        detachInterrupt(hardware_fault_irq_pin_);
 
     if (soft_timer_)
     {
@@ -90,6 +296,12 @@ MotorSetupResult HBridgeMotor::setup(const MotorMCPWMConfig &hw, const MotorBeha
     if (setup_error_ != MotorSetupError::None)
         return setupResult();
 
+    if (!acquireResources(hw, safety, cap, hardware_fault))
+    {
+        setup_error_ = MotorSetupError::ResourceConflict;
+        return setupResult();
+    }
+
     lpwm_pin_ = hw.lpwm_pin;
     rpwm_pin_ = hw.rpwm_pin;
     en_pin_ = hw.en_pin;
@@ -112,29 +324,27 @@ MotorSetupResult HBridgeMotor::setup(const MotorMCPWMConfig &hw, const MotorBeha
     soft_brake_pwm_ =
         static_cast<uint16_t>(clampValue<int>(static_cast<int>(beh_.default_soft_brake_pwm), 0, input_max_));
 
-    use_en_ = (en_pin_ >= 0);
-    if (use_en_)
+    if (en_pin_ >= 0)
     {
-        // Assert the safe level before the pin becomes an output.
-        digitalWrite(en_pin_, LOW);
+        // Preload the GPIO latch even before Arduino has registered this pin.
+        if (gpio_set_level(static_cast<gpio_num_t>(en_pin_), 0) != ESP_OK)
+        {
+            failSetup(MotorSetupError::HardwareInitFailed);
+            return setupResult();
+        }
         pinMode(en_pin_, OUTPUT);
+        use_en_ = true;
         en_state_ = false;
     }
 
-    if (mcpwm_gpio_init(mcpwm_unit_, mcpwm_sig_l_, lpwm_pin_) != ESP_OK ||
-        mcpwm_gpio_init(mcpwm_unit_, mcpwm_sig_r_, rpwm_pin_) != ESP_OK)
+    if (!isolatePwm())
     {
         failSetup(MotorSetupError::HardwareInitFailed);
         return setupResult();
     }
 
-    // Initialize both compare channels at zero before enabling optional paths.
-    // Routing and timer selection are separate legacy API calls: the caller
-    // must supply the A/B signal pair belonging to this timer.
     mcpwm_config_t cfg{};
-    cfg.frequency = pwm_freq_hz_;
-    cfg.cmpr_a = 0.0f;
-    cfg.cmpr_b = 0.0f;
+    cfg.frequency = bootstrap_hz;
     cfg.counter_mode = counter_mode_;
     cfg.duty_mode = MCPWM_DUTY_MODE_0;
     if (mcpwm_init(mcpwm_unit_, mcpwm_timer_, &cfg) != ESP_OK)
@@ -144,6 +354,14 @@ MotorSetupResult HBridgeMotor::setup(const MotorMCPWMConfig &hw, const MotorBeha
     }
     mcpwm_initialized_ = true;
     mcpwm_running_ = true;
+
+    if (!stopTimer() ||
+        mcpwm_timer_set_resolution(mcpwm_unit_, mcpwm_timer_, timerResolution(counter_mode_)) != ESP_OK ||
+        mcpwm_set_frequency(mcpwm_unit_, mcpwm_timer_, legacyFrequency(counter_mode_, pwm_freq_hz_)) != ESP_OK)
+    {
+        failSetup(MotorSetupError::HardwareInitFailed);
+        return setupResult();
+    }
 
     if (hw.use_deadtime)
     {
@@ -156,8 +374,15 @@ MotorSetupResult HBridgeMotor::setup(const MotorMCPWMConfig &hw, const MotorBeha
         deadtime_enabled_ = true;
     }
 
-    if (mcpwm_set_duty_type(mcpwm_unit_, mcpwm_timer_, MCPWM_OPR_A, MCPWM_DUTY_MODE_0) != ESP_OK ||
-        mcpwm_set_duty_type(mcpwm_unit_, mcpwm_timer_, MCPWM_OPR_B, MCPWM_DUTY_MODE_0) != ESP_OK)
+    // Clear the previous owner's timer/compare action table before installing
+    // the new count direction. Fault actions live in separate registers.
+    const uint32_t generator_offset = static_cast<uint32_t>(mcpwm_timer_) *
+        (MCPWM_GEN1_A_REG(mcpwm_unit_) - MCPWM_GEN0_A_REG(mcpwm_unit_));
+    REG_WRITE(MCPWM_GEN0_A_REG(mcpwm_unit_) + generator_offset, 0U);
+    REG_WRITE(MCPWM_GEN0_B_REG(mcpwm_unit_) + generator_offset, 0U);
+    const auto duty_mode = counter_mode_ == MCPWM_DOWN_COUNTER ? MCPWM_DUTY_MODE_1 : MCPWM_DUTY_MODE_0;
+    if (mcpwm_set_duty_type(mcpwm_unit_, mcpwm_timer_, MCPWM_OPR_A, duty_mode) != ESP_OK ||
+        mcpwm_set_duty_type(mcpwm_unit_, mcpwm_timer_, MCPWM_OPR_B, duty_mode) != ESP_OK)
     {
         failSetup(MotorSetupError::HardwareInitFailed);
         return setupResult();
@@ -206,6 +431,12 @@ MotorSetupResult HBridgeMotor::setup(const MotorMCPWMConfig &hw, const MotorBeha
                                                                : CHANGE;
         attachInterruptArg(cap_.cap_gpio, &HBridgeMotor::capISRThunk, this, mode);
         cap_irq_pin_ = cap_.cap_gpio;
+    }
+
+    if (!commandOutput(false, 0.0f, 0.0f) || startTimer() != MotorOperationError::None)
+    {
+        failSetup(MotorSetupError::HardwareInitFailed);
+        return setupResult();
     }
 
     lockState();
@@ -283,12 +514,12 @@ MotorOperationResult HBridgeMotor::drive(int speed, Dir dir) noexcept
         return reject(MotorOperation::Drive, MotorOperationError::InvalidCommand);
 
     const uint16_t request = static_cast<uint16_t>(clampValue<int>(speed, 1, input_max_));
-    const float duty = static_cast<float>(request) * percent_per_count_;
+    const float duty = request == input_max_ ? 100.0f : static_cast<float>(request) * percent_per_count_;
     lockState();
     const MotorOutputMode requested_mode = (dir == Dir::CW) ? MotorOutputMode::DriveCW : MotorOutputMode::DriveCCW;
     const bool changed = output_mode_ != requested_mode || soft_active_ || !commanded_enable_ ||
-                         std::fabs(commanded_a_percent_ - ((dir == Dir::CW) ? duty : 0.0f)) > kDutyEps ||
-                         std::fabs(commanded_b_percent_ - ((dir == Dir::CCW) ? duty : 0.0f)) > kDutyEps;
+                         commanded_a_percent_ != ((dir == Dir::CW) ? duty : 0.0f) ||
+                         commanded_b_percent_ != ((dir == Dir::CCW) ? duty : 0.0f);
     unlockState();
     stopSoftBrake();
 
@@ -306,7 +537,9 @@ MotorOperationResult HBridgeMotor::drivePercent(float percent, Dir dir) noexcept
         return reject(MotorOperation::Drive, MotorOperationError::InvalidCommand);
 
     const float clamped = clampValue<float>(percent, 0.0f, 100.0f);
-    const int speed = static_cast<int>(clamped * (static_cast<float>(getMaxPwmInput()) / 100.0f) + 0.5f);
+    // Multiply before dividing and keep enough precision for exact half counts.
+    const double scaled = static_cast<double>(clamped) * getMaxPwmInput() / 100.0;
+    const int speed = static_cast<int>(scaled + 0.5);
     return drive((speed > 0) ? speed : 1, dir);
 }
 
@@ -489,35 +722,7 @@ MotorOperationResult HBridgeMotor::pollFaults() noexcept
     }
     else
     {
-        stopSoftBrake();
-
-        // A level-follow DisableOutputs fault may have stopped MCPWM. When the
-        // observed input clears, restore only the peripheral lifecycle and an
-        // electrically quiet output; never restore the previous drive command.
-        lockState();
-        const bool running = mcpwm_running_;
-        unlockState();
-        if (!running)
-        {
-            if (mcpwm_start(mcpwm_unit_, mcpwm_timer_) != ESP_OK)
-            {
-                error = MotorOperationError::HardwareStartFailed;
-            }
-            else
-            {
-                lockState();
-                mcpwm_running_ = true;
-                unlockState();
-            }
-        }
-
-        if (error == MotorOperationError::None)
-        {
-            if (!commandOutput(false, 0.0f, 0.0f))
-                error = MotorOperationError::HardwareWriteFailed;
-            else
-                setOutputMode(MotorOutputMode::Coast);
-        }
+        error = clearFault().error;
     }
 
     if (callback)
@@ -530,7 +735,7 @@ MotorOperationResult HBridgeMotor::pollFaults() noexcept
 bool HBridgeMotor::hasFault() const noexcept
 {
     lockState();
-    const bool active = fault_latched_ || hardware_fault_active_ || hardware_fault_latched_;
+    const bool active = recovery_inhibited_ || timer_recovery_required_ || fault_latched_ || hardware_fault_active_ || hardware_fault_latched_;
     unlockState();
     return active;
 }
@@ -540,76 +745,64 @@ MotorOperationResult HBridgeMotor::clearFault() noexcept
     if (!isSetupComplete())
         return reject(MotorOperation::ClearFault, MotorOperationError::NotSetup);
 
-    // Check and clear the software-side latch as one synchronized decision.
-    // Reading the GPIO while holding the same state lock prevents an ISR from
-    // racing between the physical-level check and the latch update.
+    // Deliver pre-existing assertion work before attempting recovery; a later
+    // ISR assertion remains pending and invalidates the generation snapshot.
+    if (softwareFaultPendingSnapshot() && softwareFaultActiveSnapshot())
+        (void)pollFaults();
+
+    // Keep an admission barrier until every fallible step succeeds. Generation
+    // snapshots prevent recovery from erasing an ISR assertion during HAL work.
     lockState();
-    const bool software_input_active = (safety_.fault_gpio >= 0) ? faultInputActive() : false;
-    const bool hardware_input_active = hardware_fault_enabled_ ? hardwareFaultInputActive() : false;
-    if (software_input_active || hardware_input_active)
+    if (timer_recovery_required_)
     {
         unlockState();
-        return reject(MotorOperation::ClearFault, MotorOperationError::FaultActive);
+        return reject(MotorOperation::ClearFault, MotorOperationError::HardwareStopFailed);
     }
-
-    fault_latched_ = false;
-    fault_pending_ = false;
-    ++fault_sequence_;
+    recovery_inhibited_ = true;
+    const uint32_t software_sequence = fault_sequence_;
+    const uint32_t hardware_sequence = hardware_fault_sequence_;
+    const bool input_active = (safety_.fault_gpio >= 0 && faultInputActive()) ||
+                              (hardware_fault_enabled_ && hardwareFaultInputActive());
+    output_mode_ = MotorOutputMode::FaultContainment;
     unlockState();
+    if (input_active)
+        return reject(MotorOperation::ClearFault, MotorOperationError::FaultActive);
 
-    // Stage an electrically quiet base command *before* releasing a one-shot
-    // peripheral fault. MCPWM fault actions override the generators; they do
-    // not necessarily erase the compare values that existed before the fault.
-    // Pre-staging zero prevents an old drive duty from reappearing on re-arm.
     stopSoftBrake();
     if (!commandOutput(false, 0.0f, 0.0f))
         return reject(MotorOperation::ClearFault, MotorOperationError::HardwareWriteFailed);
-
-    if (hardware_fault_enabled_ && hardware_fault_.mode == HardwareFaultMode::OneShot)
-    {
-        if (!rearmHardwareFault())
-            return reject(MotorOperation::ClearFault, MotorOperationError::HardwareFaultClearFailed);
-    }
-    else
-    {
-        lockState();
-        hardware_fault_active_ = false;
-        hardware_fault_latched_ = false;
-        ++hardware_fault_sequence_;
-        unlockState();
-    }
+    if (!rearmHardwareFault())
+        return reject(MotorOperation::ClearFault, MotorOperationError::HardwareFaultClearFailed);
 
     lockState();
     const bool running = mcpwm_running_;
     unlockState();
-    if (!running)
-    {
-        if (mcpwm_start(mcpwm_unit_, mcpwm_timer_) != ESP_OK)
-            return reject(MotorOperation::ClearFault, MotorOperationError::HardwareStartFailed);
-        lockState();
-        mcpwm_running_ = true;
-        unlockState();
-    }
+    if ((!running || pwm_isolated_) && startTimer() != MotorOperationError::None)
+        return reject(MotorOperation::ClearFault, MotorOperationError::HardwareStartFailed);
 
-    bool ok = true;
-    switch (beh_.freewheel_mode)
+    lockState();
+    const bool superseded = software_sequence != fault_sequence_ || hardware_sequence != hardware_fault_sequence_ ||
+                            (safety_.fault_gpio >= 0 && faultInputActive()) ||
+                            (hardware_fault_enabled_ && hardwareFaultInputActive());
+    if (!superseded)
     {
-    case FreewheelMode::HiZ:
-        ok = commandOutput(false, 0.0f, 0.0f);
-        break;
-    case FreewheelMode::HiZ_Awake:
-        ok = commandOutput(true, 0.0f, 0.0f);
-        break;
-    case FreewheelMode::DitherBrake:
-        // Fault recovery is deliberately quiet. A new explicit coast/dither
-        // request is required before dither braking resumes.
-        ok = commandOutput(false, 0.0f, 0.0f);
-        break;
+        ++fault_sequence_;
+        ++hardware_fault_sequence_;
+        fault_latched_ = false;
+        hardware_fault_active_ = false;
+        hardware_fault_latched_ = false;
+        recovery_inhibited_ = false;
+        output_mode_ = MotorOutputMode::Coast;
     }
-    if (!ok)
-        return reject(MotorOperation::ClearFault, MotorOperationError::HardwareWriteFailed);
-
-    setOutputMode(MotorOutputMode::Coast);
+    unlockState();
+    // Preserve pending callback work. A superseding software assertion must
+    // retain its configured containment action as well as its notification.
+    if (superseded)
+    {
+        if (softwareFaultActiveSnapshot())
+            (void)applyFaultAction();
+        return reject(MotorOperation::ClearFault, MotorOperationError::FaultActive);
+    }
     return result(MotorOperation::ClearFault, MotorOperationError::None, true);
 }
 
@@ -682,12 +875,15 @@ MotorOperationResult HBridgeMotor::start() noexcept
     stopSoftBrake();
     if (!commandOutput(false, 0.0f, 0.0f))
         return reject(MotorOperation::Start, MotorOperationError::HardwareWriteFailed);
-    if (mcpwm_start(mcpwm_unit_, mcpwm_timer_) != ESP_OK)
-        return reject(MotorOperation::Start, MotorOperationError::HardwareStartFailed);
+    const MotorOperationError started = startTimer(true);
+    if (started != MotorOperationError::None)
+        return result(MotorOperation::Start, started, was_running);
 
-    lockState();
-    mcpwm_running_ = true;
-    unlockState();
+    if (hasFault() || (hardware_fault_enabled_ && hardwareFaultInputActive()))
+    {
+        setOutputMode(MotorOutputMode::FaultContainment);
+        return result(MotorOperation::Start, MotorOperationError::FaultActive, true);
+    }
 
     bool ok = true;
     switch (beh_.freewheel_mode)
@@ -696,8 +892,19 @@ MotorOperationResult HBridgeMotor::start() noexcept
         ok = commandOutput(false, 0.0f, 0.0f);
         break;
     case FreewheelMode::HiZ_Awake:
-        ok = commandOutput(true, 0.0f, 0.0f);
+    {
+        lockState();
+        const bool fault = hasFault() || (hardware_fault_enabled_ && hardwareFaultInputActive());
+        if (!fault)
+            ok = commandOutput(true, 0.0f, 0.0f);
+        unlockState();
+        if (fault)
+        {
+            setOutputMode(MotorOutputMode::FaultContainment);
+            return result(MotorOperation::Start, MotorOperationError::FaultActive, true);
+        }
         break;
+    }
     case FreewheelMode::DitherBrake:
     {
         lockState();
@@ -735,68 +942,67 @@ MotorOperationResult HBridgeMotor::stop() noexcept
     unlockState();
 
     stopSoftBrake();
-    const bool wrote_zero = commandOutput(false, 0.0f, 0.0f);
-    const esp_err_t stop_error = mcpwm_stop(mcpwm_unit_, mcpwm_timer_);
-
-    lockState();
-    if (stop_error == ESP_OK)
-        mcpwm_running_ = false;
-    unlockState();
-
-    if (!wrote_zero)
-        return reject(MotorOperation::Stop, MotorOperationError::HardwareWriteFailed);
-    if (stop_error != ESP_OK)
-        return reject(MotorOperation::Stop, MotorOperationError::HardwareStopFailed);
-
-    setOutputMode(MotorOutputMode::Disabled);
-    return result(MotorOperation::Stop, MotorOperationError::None, changed);
+    const MotorOperationError error = quiesceTimer();
+    return result(MotorOperation::Stop, error, changed);
 }
 
 MotorOperationResult HBridgeMotor::reconfigureFrequency(int new_hz) noexcept
 {
-    // Preserve fault containment while changing frequency. Outside a fault,
-    // quiet the outputs first and restart only previously active dither.
     if (!isSetupComplete())
         return reject(MotorOperation::ReconfigureFrequency, MotorOperationError::NotSetup);
-    if (new_hz < kPwmHzMin || new_hz > kPwmHzMax)
+    const uint32_t sdk_hz = legacyFrequency(counter_mode_, new_hz);
+    if (sdk_hz == 0U)
         return reject(MotorOperation::ReconfigureFrequency, MotorOperationError::InvalidCommand);
+    if (hasFault())
+        return reject(MotorOperation::ReconfigureFrequency, MotorOperationError::FaultActive);
 
     lockState();
+    const bool was_running = mcpwm_running_;
     const bool restart_dither = soft_active_;
-    const MotorOutputMode previous_mode = output_mode_;
     const int previous_hz = pwm_freq_hz_;
     unlockState();
-
     if (new_hz == previous_hz)
         return result(MotorOperation::ReconfigureFrequency, MotorOperationError::None, false);
+    // A running bridge needs EN to inhibit it before the two pads are
+    // remapped separately. Peripheral fault and dead-time output actions
+    // must also retain control of their configured output behavior.
+    if ((was_running && !use_en_) || hardware_fault_enabled_ || deadtime_enabled_)
+        return reject(MotorOperation::ReconfigureFrequency, MotorOperationError::Unsupported);
 
-    if (!hasFault())
-    {
-        stopSoftBrake();
-        if (!commandOutput(false, 0.0f, 0.0f))
-        {
-            containFailedDither();
-            lockState();
-            const bool changed = output_mode_ != previous_mode || soft_active_;
-            unlockState();
-            return result(MotorOperation::ReconfigureFrequency, MotorOperationError::HardwareWriteFailed, changed);
-        }
-        setOutputMode(MotorOutputMode::Coast);
-    }
+    stopSoftBrake();
+    const MotorOperationError stopped = quiesceTimer();
+    if (stopped != MotorOperationError::None)
+        return result(MotorOperation::ReconfigureFrequency, stopped, true);
+    if (hasFault())
+        return result(MotorOperation::ReconfigureFrequency, MotorOperationError::FaultActive, true);
 
-    if (mcpwm_set_frequency(mcpwm_unit_, mcpwm_timer_, new_hz) != ESP_OK)
-    {
-        lockState();
-        const bool changed = output_mode_ != previous_mode || soft_active_;
-        unlockState();
-        return result(MotorOperation::ReconfigureFrequency, MotorOperationError::FrequencyChangeFailed, changed);
-    }
+    if (mcpwm_set_frequency(mcpwm_unit_, mcpwm_timer_, sdk_hz) != ESP_OK)
+        return result(MotorOperation::ReconfigureFrequency, MotorOperationError::FrequencyChangeFailed, true);
 
     lockState();
     pwm_freq_hz_ = new_hz;
     unlockState();
 
-    if (restart_dither && !hasFault())
+    // The legacy setter rescales shadow compare values. Stage zero again at
+    // the new period and keep the pins isolated through a fresh timer boundary.
+    lockState();
+    last_a_percent_ = last_b_percent_ = -1.0f;
+    unlockState();
+    if (!commandOutput(false, 0.0f, 0.0f))
+        return result(MotorOperation::ReconfigureFrequency, MotorOperationError::HardwareWriteFailed, true);
+    if (!was_running)
+        return result(MotorOperation::ReconfigureFrequency, MotorOperationError::None, true);
+    const MotorOperationError started = startTimer(true);
+    if (started != MotorOperationError::None)
+        return result(MotorOperation::ReconfigureFrequency, started, true);
+    if (hasFault())
+    {
+        setOutputMode(MotorOutputMode::FaultContainment);
+        return result(MotorOperation::ReconfigureFrequency, MotorOperationError::FaultActive, true);
+    }
+    setOutputMode(MotorOutputMode::Coast);
+
+    if (restart_dither)
     {
         const MotorOperationError error = startSoftBrake();
         if (error != MotorOperationError::None)
@@ -840,6 +1046,7 @@ MotorDriverStatus HBridgeMotor::status() const noexcept
     out.enable_asserted = en_state_;
     out.software_fault_configured = fault_irq_pin_ >= 0;
     out.software_fault_active = fault_latched_;
+    out.recovery_inhibited = recovery_inhibited_ || timer_recovery_required_;
     out.software_fault_pending = fault_pending_;
     out.hardware_fault_configured = hardware_fault_enabled_;
     out.hardware_fault_input_active = hardware_fault_active_;
@@ -868,15 +1075,26 @@ MotorHardwareReadback HBridgeMotor::readback() const noexcept
     const int en_pin = en_pin_;
     const bool running = mcpwm_running_;
     const bool hw_fault = hardware_fault_enabled_;
+    const auto counter = counter_mode_;
+    const bool stopping = timer_stop_pending_ || timer_recovery_required_ || pwm_isolated_;
+    const auto unit = mcpwm_unit_;
+    const auto timer = mcpwm_timer_;
     unlockState();
 
     if (!setup)
         return out;
 
     out.valid = true;
-    out.frequency_hz = mcpwm_get_frequency(mcpwm_unit_, mcpwm_timer_);
-    out.duty_a_percent = mcpwm_get_duty(mcpwm_unit_, mcpwm_timer_, MCPWM_OPR_A);
-    out.duty_b_percent = mcpwm_get_duty(mcpwm_unit_, mcpwm_timer_, MCPWM_OPR_B);
+    // This is derived from the hardware period and the configured clock.
+    // Neither this register nor the legacy getter measures the active divider.
+    const uint32_t period = timerPeriod(unit, timer);
+    const uint32_t ticks = (counter == MCPWM_UP_DOWN_COUNTER) ? 2U * period : period + 1U;
+    const uint32_t clock = timerResolution(counter);
+    if (running && !stopping && ticks != 0U &&
+        mcpwm_get_frequency(unit, timer) == clock / (period + 1U))
+        out.frequency_hz = clock / ticks;
+    out.duty_a_percent = generatorDuty(counter, period, mcpwm_get_duty(unit, timer, MCPWM_OPR_A));
+    out.duty_b_percent = generatorDuty(counter, period, mcpwm_get_duty(unit, timer, MCPWM_OPR_B));
     out.enable_control = use_en;
     out.enable_asserted = use_en ? (gpio_get_level(static_cast<gpio_num_t>(en_pin)) != 0) : false;
     out.running_cached = running;
@@ -893,11 +1111,23 @@ MotorOperationResult HBridgeMotor::forceOutputs(bool a_high, bool b_high) noexce
     if (hasFault())
         return reject(MotorOperation::ForceOutputs, MotorOperationError::FaultActive);
 
+    lockState();
+    const bool running = mcpwm_running_;
+    const float a = a_high ? 100.0f : 0.0f;
+    const float b = b_high ? 100.0f : 0.0f;
+    const bool changed = output_mode_ != MotorOutputMode::Commissioning || soft_active_ ||
+                         !commanded_enable_ || commanded_a_percent_ != a || commanded_b_percent_ != b;
+    unlockState();
+    if (!running)
+        return reject(MotorOperation::ForceOutputs, MotorOperationError::InvalidCommand);
     stopSoftBrake();
-    if (!commandOutput(true, a_high ? 100.0f : 0.0f, b_high ? 100.0f : 0.0f))
+    if (!commandOutput(true, a, b))
+    {
+        setOutputMode(MotorOutputMode::Uncertain);
         return reject(MotorOperation::ForceOutputs, MotorOperationError::HardwareWriteFailed);
-
-    return result(MotorOperation::ForceOutputs, MotorOperationError::None, true);
+    }
+    setOutputMode(MotorOutputMode::Commissioning);
+    return result(MotorOperation::ForceOutputs, MotorOperationError::None, changed);
 #else
     (void)a_high;
     (void)b_high;
@@ -948,7 +1178,7 @@ void HBridgeMotor::setOutputMode(MotorOutputMode mode) noexcept
 void HBridgeMotor::softBrakeTimerTask() noexcept
 {
     lockState();
-    if (!setup_done_ || !soft_active_ || fault_latched_ || hardware_fault_active_ || hardware_fault_latched_)
+    if (!setup_done_ || !soft_active_ || recovery_inhibited_ || fault_latched_ || hardware_fault_active_ || hardware_fault_latched_)
     {
         soft_active_ = false;
         unlockState();
@@ -988,7 +1218,7 @@ HBridgeMotor::OutputCommitResult HBridgeMotor::applyDitherPhase(BrakePhase phase
     const float duty = (phase == BrakePhase::Brake) ? 100.0f : 0.0f;
 
     lockState();
-    if (!setup_done_ || !soft_active_ || fault_latched_ || hardware_fault_active_ || hardware_fault_latched_ ||
+    if (!setup_done_ || !soft_active_ || recovery_inhibited_ || fault_latched_ || hardware_fault_active_ || hardware_fault_latched_ ||
         soft_sequence_ != sequence)
     {
         unlockState();
@@ -1006,7 +1236,7 @@ HBridgeMotor::OutputCommitResult HBridgeMotor::applyDitherPhase(BrakePhase phase
 HBridgeMotor::TimerCommandResult HBridgeMotor::scheduleNextPhase(uint32_t sequence) noexcept
 {
     lockState();
-    if (!soft_active_ || fault_latched_ || hardware_fault_active_ || hardware_fault_latched_ ||
+    if (!soft_active_ || recovery_inhibited_ || fault_latched_ || hardware_fault_active_ || hardware_fault_latched_ ||
         soft_sequence_ != sequence)
     {
         unlockState();
@@ -1192,12 +1422,17 @@ HBridgeMotor::OutputCommitResult HBridgeMotor::writeHardwareOutput(uint32_t sequ
 
     const bool enable_controlled = use_en_;
     const bool enable_asserted = en_state_;
+    const uint32_t period = counter_mode_ == MCPWM_UP_COUNTER ? 0U : timerPeriod(mcpwm_unit_, mcpwm_timer_);
+    const auto writeDuty = [&](mcpwm_operator_t channel, float percent) {
+        return mcpwm_set_duty(mcpwm_unit_, mcpwm_timer_, channel, comparatorDuty(counter_mode_, period, percent));
+    };
+
     const float last_a = last_a_percent_;
     const float last_b = last_b_percent_;
 
-    const bool both_change = std::fabs(a_percent - last_a) > kDutyEps && std::fabs(b_percent - last_b) > kDutyEps;
+    const bool both_change = a_percent != last_a && b_percent != last_b;
 
-    const auto contain_after_failure = [this, sequence]() -> OutputCommitResult
+    const auto contain_after_failure = [this, sequence, &writeDuty]() -> OutputCommitResult
     {
         if (use_en_ && en_state_)
         {
@@ -1207,11 +1442,11 @@ HBridgeMotor::OutputCommitResult HBridgeMotor::writeHardwareOutput(uint32_t sequ
 
         if (sequence != output_sequence_)
             return OutputCommitResult::Stale;
-        if (mcpwm_set_duty(mcpwm_unit_, mcpwm_timer_, MCPWM_OPR_A, 0.0f) == ESP_OK)
+        if (writeDuty(MCPWM_OPR_A, 0.0f) == ESP_OK)
             last_a_percent_ = 0.0f;
         if (sequence != output_sequence_)
             return OutputCommitResult::Stale;
-        if (mcpwm_set_duty(mcpwm_unit_, mcpwm_timer_, MCPWM_OPR_B, 0.0f) == ESP_OK)
+        if (writeDuty(MCPWM_OPR_B, 0.0f) == ESP_OK)
             last_b_percent_ = 0.0f;
         return (sequence == output_sequence_) ? OutputCommitResult::HardwareFailed : OutputCommitResult::Stale;
     };
@@ -1228,9 +1463,9 @@ HBridgeMotor::OutputCommitResult HBridgeMotor::writeHardwareOutput(uint32_t sequ
     if (sequence != output_sequence_)
         return OutputCommitResult::Stale;
 
-    if (std::fabs(a_percent - last_a_percent_) > kDutyEps)
+    if (a_percent != last_a_percent_)
     {
-        const esp_err_t error = mcpwm_set_duty(mcpwm_unit_, mcpwm_timer_, MCPWM_OPR_A, a_percent);
+        const esp_err_t error = writeDuty(MCPWM_OPR_A, a_percent);
         if (sequence != output_sequence_)
             return OutputCommitResult::Stale;
         if (error != ESP_OK)
@@ -1241,9 +1476,9 @@ HBridgeMotor::OutputCommitResult HBridgeMotor::writeHardwareOutput(uint32_t sequ
     if (sequence != output_sequence_)
         return OutputCommitResult::Stale;
 
-    if (std::fabs(b_percent - last_b_percent_) > kDutyEps)
+    if (b_percent != last_b_percent_)
     {
-        const esp_err_t error = mcpwm_set_duty(mcpwm_unit_, mcpwm_timer_, MCPWM_OPR_B, b_percent);
+        const esp_err_t error = writeDuty(MCPWM_OPR_B, b_percent);
         if (sequence != output_sequence_)
             return OutputCommitResult::Stale;
         if (error != ESP_OK)
@@ -1328,9 +1563,11 @@ void HBridgeMotor::faultISR() noexcept
     const bool active = faultInputActive();
 
     lockStateISR();
+    if (active)
+        recovery_inhibited_ = true;
     if (safety_.oneshot)
     {
-        if (active && !fault_latched_)
+        if (active && (!fault_latched_ || recovery_inhibited_))
         {
             fault_latched_ = true;
             fault_pending_ = true;
@@ -1379,14 +1616,12 @@ MotorOperationError HBridgeMotor::applyFaultAction() noexcept
         return commandOutput(false, 0.0f, 0.0f) ? MotorOperationError::None : MotorOperationError::HardwareWriteFailed;
 
     case FaultAction::DisableOutputs:
-        if (!commandOutput(false, 0.0f, 0.0f))
-            return MotorOperationError::HardwareWriteFailed;
-        if (mcpwm_stop(mcpwm_unit_, mcpwm_timer_) != ESP_OK)
-            return MotorOperationError::HardwareStopFailed;
-        lockState();
-        mcpwm_running_ = false;
-        unlockState();
-        return MotorOperationError::None;
+    {
+        const MotorOperationError error = quiesceTimer();
+        if (error == MotorOperationError::None)
+            setOutputMode(MotorOutputMode::FaultContainment);
+        return error;
+    }
 
     case FaultAction::HardBrake:
         return emergencyBrake();
@@ -1397,11 +1632,8 @@ MotorOperationError HBridgeMotor::applyFaultAction() noexcept
 
 MotorOperationError HBridgeMotor::emergencyBrake() noexcept
 {
-    if (mcpwm_start(mcpwm_unit_, mcpwm_timer_) != ESP_OK)
+    if (startTimer() != MotorOperationError::None)
         return MotorOperationError::HardwareStartFailed;
-    lockState();
-    mcpwm_running_ = true;
-    unlockState();
 
     return commandOutput(true, 100.0f, 100.0f) ? MotorOperationError::None : MotorOperationError::HardwareWriteFailed;
 }
@@ -1463,7 +1695,8 @@ void HBridgeMotor::hardwareFaultISR() noexcept
     else if (hardware_fault_.mode == HardwareFaultMode::CycleByCycle)
         hardware_fault_latched_ = active;
 
-    if (old_active != hardware_fault_active_ || old_latched != hardware_fault_latched_)
+    if (old_active != hardware_fault_active_ || old_latched != hardware_fault_latched_ ||
+        (active && recovery_inhibited_))
         ++hardware_fault_sequence_;
     unlockStateISR();
 }
@@ -1481,6 +1714,7 @@ bool HBridgeMotor::configureHardwareFault() noexcept
     pinMode(hardware_fault_.fault_gpio, INPUT);
     if (mcpwm_gpio_init(mcpwm_unit_, io_signal, hardware_fault_.fault_gpio) != ESP_OK)
         return false;
+    hardware_fault_enabled_ = true;
     if (mcpwm_fault_init(mcpwm_unit_, MCPWM_HIGH_LEVEL_TGR, fault_signal) != ESP_OK)
         return false;
 
@@ -1499,10 +1733,10 @@ bool HBridgeMotor::configureHardwareFault() noexcept
             : mcpwm_fault_set_cyc_mode(mcpwm_unit_, mcpwm_timer_, fault_signal, action_a, action_b);
     if (mode_result != ESP_OK)
     {
-        (void)mcpwm_fault_deinit(mcpwm_unit_, fault_signal);
         return false;
     }
 
+    hardware_fault_mode_configured_ = true;
     attachInterruptArg(hardware_fault_.fault_gpio, &HBridgeMotor::hardwareFaultISRThunk, this, CHANGE);
     hardware_fault_irq_pin_ = hardware_fault_.fault_gpio;
 
@@ -1542,11 +1776,6 @@ bool HBridgeMotor::rearmHardwareFault() noexcept
     if (mcpwm_fault_set_oneshot_mode(mcpwm_unit_, mcpwm_timer_, fault_signal, action_a, action_b) != ESP_OK)
         return false;
 
-    lockState();
-    hardware_fault_active_ = false;
-    hardware_fault_latched_ = false;
-    ++hardware_fault_sequence_;
-    unlockState();
     return true;
 }
 
@@ -1561,13 +1790,27 @@ bool HBridgeMotor::detachHardwareFault() noexcept
     bool detached = true;
     if (hardware_fault_enabled_)
     {
-        detached = mcpwm_fault_deinit(mcpwm_unit_, hardwareFaultSignal(hardware_fault_.input)) == ESP_OK;
+        const mcpwm_fault_signal_t signal = hardwareFaultSignal(hardware_fault_.input);
+        // Legacy deinit disables detection but leaves per-operator brake actions.
+        // Neutralize both action tables before allowing later unit reuse.
+        bool neutral = true;
+        if (hardware_fault_mode_configured_)
+        {
+            const bool oneshot = mcpwm_fault_set_oneshot_mode(mcpwm_unit_, mcpwm_timer_, signal,
+                                  MCPWM_NO_CHANGE_IN_MCPWMXA, MCPWM_NO_CHANGE_IN_MCPWMXB) == ESP_OK;
+            const bool cyclic = mcpwm_fault_set_cyc_mode(mcpwm_unit_, mcpwm_timer_, signal,
+                                 MCPWM_NO_CHANGE_IN_MCPWMXA, MCPWM_NO_CHANGE_IN_MCPWMXB) == ESP_OK;
+            neutral = oneshot && cyclic;
+        }
+        const bool disabled = mcpwm_fault_deinit(mcpwm_unit_, signal) == ESP_OK;
+        detached = neutral && disabled;
     }
 
     lockState();
     if (detached)
     {
         hardware_fault_enabled_ = false;
+        hardware_fault_mode_configured_ = false;
         hardware_fault_active_ = false;
         hardware_fault_latched_ = false;
     }
@@ -1634,51 +1877,180 @@ void HBridgeMotor::detachCaptureInterrupt() noexcept
 
 // ---- Setup / teardown helpers ---- //
 
+bool HBridgeMotor::isolatePwm() noexcept
+{
+    // Take the GPIO matrix route away from MCPWM. A low GPIO latch bypasses
+    // generator, compare and dead-time state even without a bridge enable pin.
+    const auto left = static_cast<gpio_num_t>(lpwm_pin_);
+    const auto right = static_cast<gpio_num_t>(rpwm_pin_);
+    bool isolated = false;
+    if (gpio_set_level(left, 0) == ESP_OK && gpio_set_level(right, 0) == ESP_OK)
+    {
+        // The pad changes are sequential. Keep task preemption out of the
+        // interval, and configure the already-rerouted pads after releasing.
+        lockState();
+        esp_rom_gpio_connect_out_signal(static_cast<uint32_t>(left), SIG_GPIO_OUT_IDX, false, false);
+        esp_rom_gpio_connect_out_signal(static_cast<uint32_t>(right), SIG_GPIO_OUT_IDX, false, false);
+        unlockState();
+
+        gpio_config_t output{};
+        output.pin_bit_mask = (UINT64_C(1) << static_cast<uint32_t>(left)) |
+                              (UINT64_C(1) << static_cast<uint32_t>(right));
+        output.mode = GPIO_MODE_OUTPUT;
+        isolated = gpio_config(&output) == ESP_OK;
+    }
+    lockState();
+    pwm_isolated_ = isolated;
+    unlockState();
+    return isolated;
+}
+
+bool HBridgeMotor::stopTimer() noexcept
+{
+    lockState();
+    const bool running = mcpwm_running_;
+    const bool pending = timer_stop_pending_;
+    unlockState();
+    if (!running)
+        return true;
+
+    const uint32_t mask = MCPWM_TIMER0_STOP_INT_RAW << static_cast<uint32_t>(mcpwm_timer_);
+    if (!pending)
+    {
+        // W1C only our timer's stale event, before the request. A retry waits
+        // for the original event so it can recover even after a late stop.
+        REG_WRITE(MCPWM_INT_CLR_REG(mcpwm_unit_), mask);
+        if (mcpwm_stop(mcpwm_unit_, mcpwm_timer_) != ESP_OK)
+            return false;
+        lockState();
+        timer_stop_pending_ = true;
+        unlockState();
+    }
+    if (!waitForTimerEvent(mcpwm_unit_, mask))
+        return false;
+    lockState();
+    timer_stop_pending_ = false;
+    mcpwm_running_ = false;
+    unlockState();
+    return true;
+}
+
+MotorOperationError HBridgeMotor::startTimer(bool abort_on_fault) noexcept
+{
+    lockState();
+    const bool unsafe = timer_stop_pending_ || timer_recovery_required_;
+    unlockState();
+    if (unsafe)
+        return MotorOperationError::HardwareStartFailed;
+
+    const uint32_t timer = static_cast<uint32_t>(mcpwm_timer_);
+    const uint32_t empty = MCPWM_TIMER0_TEZ_INT_RAW << timer;
+    const uint32_t full = MCPWM_TIMER0_TEP_INT_RAW << timer;
+    REG_WRITE(MCPWM_INT_CLR_REG(mcpwm_unit_), full);
+    if (mcpwm_start(mcpwm_unit_, mcpwm_timer_) != ESP_OK)
+        return MotorOperationError::HardwareStartFailed;
+    lockState();
+    mcpwm_running_ = true;
+    unlockState();
+    if (!pwm_isolated_)
+        return MotorOperationError::None;
+
+    const bool reached_full = waitForTimerEvent(mcpwm_unit_, full);
+    // Observe zero after peak, even if the initial start at zero also set TEZ.
+    // Both the compare shadow update and the generator's zero-duty action
+    // have then had a timer event in the new cycle before either pin is routed.
+    REG_WRITE(MCPWM_INT_CLR_REG(mcpwm_unit_), empty);
+    if (!reached_full || !waitForTimerEvent(mcpwm_unit_, empty))
+    {
+        const bool stopped = stopTimer();
+        lockState();
+        timer_recovery_required_ = !stopped;
+        unlockState();
+        return MotorOperationError::HardwareStartFailed;
+    }
+
+    if (abort_on_fault && (hasFault() || (hardware_fault_enabled_ && hardwareFaultInputActive())))
+    {
+        const bool stopped = stopTimer();
+        lockState();
+        timer_recovery_required_ = !stopped;
+        unlockState();
+        return MotorOperationError::FaultActive;
+    }
+
+    const bool routed = mcpwm_gpio_init(mcpwm_unit_, mcpwm_sig_l_, lpwm_pin_) == ESP_OK &&
+                        mcpwm_gpio_init(mcpwm_unit_, mcpwm_sig_r_, rpwm_pin_) == ESP_OK;
+    lockState();
+    pwm_isolated_ = false;
+    unlockState();
+    if (!routed)
+    {
+        const bool isolated = isolatePwm();
+        const bool stopped = stopTimer();
+        lockState();
+        timer_recovery_required_ = !isolated || !stopped;
+        unlockState();
+    }
+    return routed ? MotorOperationError::None : MotorOperationError::HardwareStartFailed;
+}
+
+MotorOperationError HBridgeMotor::quiesceTimer() noexcept
+{
+    // EN must fall before either PWM pad is remapped. On a bridge without
+    // EN, isolate both pads before committing buffered compare changes.
+    bool isolated = false;
+    if (!use_en_)
+        isolated = isolatePwm();
+    const bool zeroed = commandOutput(false, 0.0f, 0.0f);
+    if (use_en_)
+        isolated = isolatePwm();
+    const bool stopped = stopTimer();
+    lockState();
+    output_mode_ = (isolated || (use_en_ && !en_state_)) ? MotorOutputMode::Disabled : MotorOutputMode::Uncertain;
+    // A partial stop inhibits commands until the owner retries stop or setup.
+    timer_recovery_required_ = !zeroed || !isolated || !stopped;
+    unlockState();
+    if (!zeroed || !isolated)
+        return MotorOperationError::HardwareWriteFailed;
+    return stopped ? MotorOperationError::None : MotorOperationError::HardwareStopFailed;
+}
+
 MotorSetupError HBridgeMotor::prepareForSetup() noexcept
 {
     // Keep the old resource identity until every containment step succeeds;
     // clearing it early would prevent a later attempt from retrying teardown.
     stopSoftBrake();
 
-    bool zeroed = true;
-    bool deadtime_disabled = true;
-    bool stopped = true;
-    if (setup_done_ || mcpwm_initialized_)
+    if (mcpwm_initialized_)
     {
-        zeroed = commandOutput(false, 0.0f, 0.0f);
-        if (deadtime_enabled_)
-            deadtime_disabled = mcpwm_deadtime_disable(mcpwm_unit_, mcpwm_timer_) == ESP_OK;
-        stopped = mcpwm_stop(mcpwm_unit_, mcpwm_timer_) == ESP_OK;
-
-        lockState();
-        if (stopped)
-            mcpwm_running_ = false;
-        if (deadtime_disabled)
-            deadtime_enabled_ = false;
-        const bool contained_by_en = use_en_ && !en_state_;
-        const bool contained = contained_by_en || (zeroed && stopped);
-        if (!zeroed || !deadtime_disabled || !stopped)
+        const MotorOperationError stopped = quiesceTimer();
+        if (stopped != MotorOperationError::None ||
+            (deadtime_enabled_ && mcpwm_deadtime_disable(mcpwm_unit_, mcpwm_timer_) != ESP_OK))
         {
+            lockState();
             setup_error_ = MotorSetupError::ContainmentFailed;
-            output_mode_ = contained ? MotorOutputMode::Disabled : MotorOutputMode::Uncertain;
+            timer_recovery_required_ = true;
             unlockState();
             return MotorSetupError::ContainmentFailed;
         }
-        unlockState();
+        deadtime_enabled_ = false;
     }
 
     detachFaultInterrupt();
     detachCaptureInterrupt();
-    if (!detachHardwareFault())
+    if (!detachHardwareFault() || !releaseResources())
     {
         lockState();
         setup_error_ = MotorSetupError::ContainmentFailed;
-        output_mode_ = MotorOutputMode::Disabled;
+        output_mode_ = (pwm_isolated_ || (use_en_ && !en_state_))
+                           ? MotorOutputMode::Disabled : MotorOutputMode::Uncertain;
+        timer_recovery_required_ = true;
         unlockState();
-        return MotorSetupError::ContainmentFailed;
+        return setup_error_;
     }
 
     lockState();
+    recovery_inhibited_ = false;
     fault_latched_ = false;
     fault_pending_ = false;
     fault_sequence_ = 0;
@@ -1694,6 +2066,9 @@ MotorSetupError HBridgeMotor::prepareForSetup() noexcept
     setup_done_ = false;
     mcpwm_initialized_ = false;
     mcpwm_running_ = false;
+    timer_stop_pending_ = false;
+    timer_recovery_required_ = false;
+    pwm_isolated_ = false;
     deadtime_enabled_ = false;
     hardware_fault_enabled_ = false;
     hardware_fault_ = MotorHardwareFaultConfig{};
@@ -1736,9 +2111,16 @@ MotorSetupError HBridgeMotor::validateConfig(const MotorMCPWMConfig &hw, const M
                                              const MotorSafetyConfig &safety, const MotorCaptureConfig &cap,
                                              const MotorHardwareFaultConfig &hardware_fault) const noexcept
 {
-    // These checks cover pin conflicts within this configuration and timing
-    // ranges. Matching timer/signals and exclusive peripheral use remain the
-    // application's responsibility; there is no cross-instance registry.
+    // Legacy duty writes bind timer x to operator x and generators A/B.
+    if (static_cast<int>(hw.unit) < 0 || hw.unit >= SOC_MCPWM_GROUPS ||
+        static_cast<int>(hw.timer) < 0 || hw.timer >= SOC_MCPWM_TIMERS_PER_GROUP ||
+        hw.timer >= SOC_MCPWM_OPERATORS_PER_GROUP ||
+        static_cast<int>(hw.sig_l) != 2 * static_cast<int>(hw.timer) ||
+        static_cast<int>(hw.sig_r) != 2 * static_cast<int>(hw.timer) + 1)
+        return MotorSetupError::InvalidTimerSignals;
+    // Legacy RED/FED arguments are register counts, not nanoseconds.
+    if (hw.use_deadtime && (hw.deadtime_red_ns > UINT16_MAX || hw.deadtime_fed_ns > UINT16_MAX))
+        return MotorSetupError::InvalidDeadtime;
     if (!GPIO_IS_VALID_OUTPUT_GPIO(hw.lpwm_pin) || !GPIO_IS_VALID_OUTPUT_GPIO(hw.rpwm_pin))
         return MotorSetupError::InvalidPwmPin;
     if (hw.lpwm_pin == hw.rpwm_pin)
@@ -1748,7 +2130,7 @@ MotorSetupError HBridgeMotor::validateConfig(const MotorMCPWMConfig &hw, const M
         return MotorSetupError::PinConflict;
     if (hw.sig_l == hw.sig_r)
         return MotorSetupError::PinConflict;
-    if (hw.pwm_freq_hz < kPwmHzMin || hw.pwm_freq_hz > kPwmHzMax)
+    if (legacyFrequency(hw.counter, hw.pwm_freq_hz) == 0U)
         return MotorSetupError::InvalidPwmFrequency;
     if (hw.input_max <= 0 || hw.input_max > static_cast<int>(UINT16_MAX))
         return MotorSetupError::InvalidInputRange;
@@ -1772,6 +2154,8 @@ MotorSetupError HBridgeMotor::validateConfig(const MotorMCPWMConfig &hw, const M
 
     if (hardware_fault.mode != HardwareFaultMode::Disabled)
     {
+        if (static_cast<int>(hardware_fault.input) >= SOC_MCPWM_GPIO_FAULTS_PER_GROUP)
+            return MotorSetupError::InvalidHardwareFaultConfig;
         if (hardware_fault.fault_gpio < 0 || !GPIO_IS_VALID_GPIO(hardware_fault.fault_gpio))
             return MotorSetupError::InvalidHardwareFaultConfig;
         if (!hardware_fault.active_high)
@@ -1795,29 +2179,27 @@ void HBridgeMotor::failSetup(MotorSetupError error) noexcept
     // whether partially initialized hardware still needs containment.
     detachFaultInterrupt();
     detachCaptureInterrupt();
-    const bool hardware_fault_detached = detachHardwareFault();
     stopSoftBrake();
 
-    bool zeroed = true;
-    bool deadtime_disabled = true;
-    bool stopped = true;
-    if (mcpwm_initialized_)
-    {
-        zeroed = commandOutput(false, 0.0f, 0.0f);
-        if (deadtime_enabled_)
-            deadtime_disabled = mcpwm_deadtime_disable(mcpwm_unit_, mcpwm_timer_) == ESP_OK;
-        stopped = mcpwm_stop(mcpwm_unit_, mcpwm_timer_) == ESP_OK;
-    }
+    const bool stopped = !mcpwm_initialized_ || quiesceTimer() == MotorOperationError::None;
+    const bool deadtime_disabled = stopped &&
+        (!deadtime_enabled_ || mcpwm_deadtime_disable(mcpwm_unit_, mcpwm_timer_) == ESP_OK);
 
+    // Preserve peripheral fault actions and reservation until the pins and
+    // timer are contained. Never detach a brake over an unconfirmed stop.
+    const bool hardware_fault_detached = stopped && detachHardwareFault();
+    if (!hardware_fault_detached && hardware_fault_irq_pin_ >= 0)
+    {
+        detachInterrupt(hardware_fault_irq_pin_);
+        hardware_fault_irq_pin_ = -1;
+    }
+    const bool teardown_ok = stopped && deadtime_disabled && hardware_fault_detached && releaseResources();
     lockState();
     const bool contained_by_en = use_en_ && !en_state_;
-    const bool contained = contained_by_en || (zeroed && stopped);
-    const bool teardown_ok = zeroed && deadtime_disabled && stopped && hardware_fault_detached;
+    const bool contained = contained_by_en || pwm_isolated_;
     setup_done_ = false;
     if (teardown_ok)
         mcpwm_initialized_ = false;
-    if (stopped)
-        mcpwm_running_ = false;
     if (deadtime_disabled)
         deadtime_enabled_ = false;
     if (hardware_fault_detached)

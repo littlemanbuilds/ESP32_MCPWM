@@ -33,5 +33,4 @@ public:
 };
 
 static HostSerial Serial;
-inline void delay(unsigned long) {}
 inline void tone(uint8_t, unsigned int) {}

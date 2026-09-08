@@ -12,6 +12,8 @@ bash test/run_native_tests.sh
 
 The suite builds as C++11 with strict warnings. It uses deterministic Arduino, GPIO, MCPWM and `esp_timer` mocks and covers setup/containment, physical output ordering, custom-driver interface truthfulness, explicit drive/coast/brake behavior, literal changed semantics, lifecycle failures, software faults, MCPWM hardware-fault configuration, dither failure containment, capture, readback and commissioning API gating.
 
+Focused regressions also cover timer/signal mapping, instance ownership/reuse/quarantine, shared hardware-fault unit exclusion, GPIO conflicts, failed recovery admission, concurrent fault assertions and exact legacy deadtime forwarding. Commissioning tests cover stopped/faulted rejection, raw status, failure and return to normal commands.
+
 The same script also runs a synchronized ISR/task concurrency stress case.
 
 ## Sanitizers
@@ -43,6 +45,18 @@ pinned PlatformIO configuration and CI commands. Run the aggregate suite with
 copy has no executable bits and runs the native, sanitizer, concurrency, example
 and release checks. `GCC_CXX` and `CLANG_CXX` select genuine GNU GCC and Clang;
 Apple's `g++` alias cannot substitute for the GNU GCC gate.
+
+For a proposed release, supply the target version, planned publication date,
+proposed tag and a release-notes file whose first line is its title. Run the
+metadata mutations against a disposable copy with the same arguments.
+
+```bash
+bash test/check_release_contracts.sh --release VERSION DATE TAG NOTES_FILE
+python3 -B test/test_release_metadata.py VERSION DATE TAG NOTES_FILE
+```
+
+These checks verify metadata. Final-commit CI and the applicable hardware and
+publication gates are tracked separately in the release checklist.
 
 ## Target compile
 

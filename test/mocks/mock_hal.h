@@ -35,14 +35,16 @@ static constexpr esp_err_t ESP_OK = 0;
 enum mcpwm_unit_t
 {
     MCPWM_UNIT_0,
-    MCPWM_UNIT_1
+    MCPWM_UNIT_1,
+    MCPWM_UNIT_MAX
 };
 
 enum mcpwm_timer_t
 {
     MCPWM_TIMER_0,
     MCPWM_TIMER_1,
-    MCPWM_TIMER_2
+    MCPWM_TIMER_2,
+    MCPWM_TIMER_MAX
 };
 
 enum mcpwm_io_signals_t
@@ -92,6 +94,7 @@ enum mcpwm_operator_t
 
 enum mcpwm_counter_type_t
 {
+    MCPWM_FREEZE_COUNTER,
     MCPWM_UP_COUNTER,
     MCPWM_DOWN_COUNTER,
     MCPWM_UP_DOWN_COUNTER
@@ -110,11 +113,11 @@ enum mcpwm_deadtime_type_t
 
 struct mcpwm_config_t
 {
-    int frequency;
+    uint32_t frequency;
     float cmpr_a;
     float cmpr_b;
-    mcpwm_counter_type_t counter_mode;
     mcpwm_duty_type_t duty_mode;
+    mcpwm_counter_type_t counter_mode;
 };
 
 struct MockEspTimer;
@@ -150,7 +153,10 @@ namespace mock_hal
 enum class EventKind
 {
     PinMode,
+    GpioReset,
+    GpioInputRelease,
     DigitalWrite,
+    GpioLatch,
     McpwmGpioInit,
     McpwmInit,
     DeadtimeEnable,
@@ -194,18 +200,81 @@ struct Interrupt
 
 extern std::vector<Event> events;
 extern std::unordered_map<int, int> pin_modes;
+extern std::unordered_map<int, std::pair<bool, bool>> pin_pulls; // (pull-up, pull-down)
 extern std::unordered_map<int, int> pin_levels;
 extern std::unordered_map<int, Interrupt> interrupts;
 extern std::array<std::array<std::array<float, 2>, 3>, 2> duties;
 extern std::array<std::array<bool, 3>, 2> running;
-extern std::array<std::array<uint32_t, 3>, 2> frequencies;
+struct PwmTimer
+{
+    uint32_t resolution_hz = 1000000U;        // Configured divider, visible to SDK reads.
+    uint32_t active_resolution_hz = 1000000U; // Divider latched when a stopped timer starts.
+    uint32_t phase_ticks = 0;
+    uint32_t period_register = 0;
+    uint32_t events = 0;
+    bool stop_pending = false;
+    bool duty_mode_inverted = false;
+    std::array<uint32_t, 2> shadow_compare{};
+    std::array<uint32_t, 2> active_compare{};
+    mcpwm_counter_type_t mode = MCPWM_UP_COUNTER;
+
+    /// @brief Return ticks between like edges, using the hardware count sequence.
+    ///
+    /// @return Timer ticks in one output cycle.
+    uint32_t cycleTicks() const
+    {
+        return mode == MCPWM_UP_DOWN_COUNTER ? 2U * period_register : period_register + 1U;
+    }
+
+    /// @brief Calculate steady-state high ticks from a raw SDK duty argument.
+    ///
+    /// @param duty Percentage configured at the SDK comparator boundary.
+    /// @return Timer ticks high in one cycle once the comparator value latches.
+    uint32_t highTicks(float duty) const
+    {
+        return highTicksForCompare(compareForDuty(duty));
+    }
+
+    uint32_t compareForDuty(float duty) const
+    {
+        return static_cast<uint32_t>(static_cast<float>(period_register + 1U) * duty / 100.0f);
+    }
+
+    uint32_t highTicksForCompare(uint32_t compare) const
+    {
+        if (mode == MCPWM_DOWN_COUNTER && duty_mode_inverted)
+            return compare > period_register ? cycleTicks() : period_register - compare;
+        if (mode != MCPWM_UP_DOWN_COUNTER)
+            return compare;
+        return compare >= period_register ? cycleTicks() : 2U * compare;
+    }
+};
+constexpr uint32_t stopped_event = 1U;
+constexpr uint32_t empty_event = 2U;
+constexpr uint32_t full_event = 4U;
+extern std::array<std::array<PwmTimer, 3>, 2> pwm_timers;
+extern std::unordered_map<int, std::pair<mcpwm_unit_t, mcpwm_io_signals_t>> pwm_routes;
+extern unsigned live_period_writes;
+extern unsigned active_reinitializations;
+extern unsigned unsafe_routes;
+extern unsigned remaps_while_enabled;
+extern int observed_enable_pin;
+extern bool suppress_timer_stop;
+extern bool suppress_timer_empty;
+extern void (*pwm_wait_hook)();
+
 extern std::vector<MockEspTimer *> timers;
 extern MockEspTimer *last_timer;
 extern uint32_t micros_value;
 extern int timer_create_count;
 extern esp_err_t gpio_init_result;
+extern int gpio_release_failure_pin;
+extern esp_err_t gpio_level_result;
+extern uint32_t deadtime_red;
+extern uint32_t deadtime_fed;
 extern esp_err_t mcpwm_init_result;
 extern esp_err_t frequency_result;
+extern esp_err_t resolution_result;
 extern esp_err_t duty_result;
 extern std::vector<esp_err_t> duty_results;
 extern esp_err_t deadtime_disable_result;
@@ -217,24 +286,41 @@ extern esp_err_t fault_deinit_result;
 extern esp_err_t timer_create_result;
 extern esp_err_t timer_start_result;
 extern void (*duty_hook)();
+extern void (*fault_mode_hook)();
+extern void (*start_hook)();
 extern void (*timer_start_hook)();
 
 inline void reset()
 {
     events.clear();
     pin_modes.clear();
+    pin_pulls.clear();
     pin_levels.clear();
     interrupts.clear();
     duties = {};
     running = {};
-    frequencies = {};
+    pwm_timers = {};
+    pwm_routes.clear();
+    live_period_writes = 0;
+    active_reinitializations = 0;
+    unsafe_routes = 0;
+    remaps_while_enabled = 0;
+    observed_enable_pin = -1;
+    suppress_timer_stop = false;
+    suppress_timer_empty = false;
+    pwm_wait_hook = nullptr;
     timers.clear();
     last_timer = nullptr;
     micros_value = 0;
     timer_create_count = 0;
     gpio_init_result = ESP_OK;
+    gpio_release_failure_pin = -1;
+    gpio_level_result = ESP_OK;
+    deadtime_red = 0;
+    deadtime_fed = 0;
     mcpwm_init_result = ESP_OK;
     frequency_result = ESP_OK;
+    resolution_result = ESP_OK;
     duty_result = ESP_OK;
     duty_results.clear();
     deadtime_disable_result = ESP_OK;
@@ -246,6 +332,8 @@ inline void reset()
     timer_create_result = ESP_OK;
     timer_start_result = ESP_OK;
     duty_hook = nullptr;
+    fault_mode_hook = nullptr;
+    start_hook = nullptr;
     timer_start_hook = nullptr;
 }
 
@@ -281,6 +369,7 @@ static constexpr int FALLING = 6;
 inline void pinMode(int pin, int mode)
 {
     mock_hal::pin_modes[pin] = mode;
+    mock_hal::pin_pulls[pin] = {mode == INPUT_PULLUP, mode == INPUT_PULLDOWN};
     mock_hal::events.push_back({mock_hal::EventKind::PinMode, pin, mode});
 }
 
@@ -304,28 +393,96 @@ inline void detachInterrupt(int pin)
 
 inline uint32_t micros() { return mock_hal::micros_value; }
 
+inline void delayMicroseconds(uint32_t duration)
+{
+    mock_hal::micros_value += duration;
+    for (std::size_t unit = 0; unit < mock_hal::pwm_timers.size(); ++unit)
+    {
+        for (std::size_t timer = 0; timer < mock_hal::pwm_timers[unit].size(); ++timer)
+        {
+            auto &pwm = mock_hal::pwm_timers[unit][timer];
+            if (!mock_hal::running[unit][timer])
+                continue;
+            const uint32_t cycle = pwm.cycleTicks();
+            const uint32_t ticks = duration * (pwm.active_resolution_hz / 1000000U);
+            const uint32_t position = pwm.phase_ticks + ticks;
+            const uint32_t full = pwm.mode == MCPWM_DOWN_COUNTER ? cycle : pwm.period_register;
+            if (position >= cycle || (pwm.phase_ticks < full && position >= full))
+            {
+                pwm.events |= mock_hal::full_event;
+                pwm.active_compare = pwm.shadow_compare;
+            }
+            if (position >= cycle)
+            {
+                pwm.active_compare = pwm.shadow_compare;
+                if (!mock_hal::suppress_timer_empty)
+                    pwm.events |= mock_hal::empty_event;
+                if (pwm.stop_pending && !mock_hal::suppress_timer_stop)
+                {
+                    pwm.events |= mock_hal::stopped_event;
+                    mock_hal::running[unit][timer] = false;
+                    pwm.stop_pending = false;
+                    pwm.phase_ticks = 0;
+                    continue;
+                }
+            }
+            pwm.phase_ticks = position % cycle;
+        }
+    }
+    if (mock_hal::pwm_wait_hook)
+    {
+        auto hook = mock_hal::pwm_wait_hook;
+        mock_hal::pwm_wait_hook = nullptr;
+        hook();
+    }
+}
+
+inline void delay(unsigned long duration) { delayMicroseconds(static_cast<uint32_t>(duration) * 1000U); }
+
 inline esp_err_t mcpwm_gpio_init(mcpwm_unit_t unit, mcpwm_io_signals_t signal, int pin)
 {
     mock_hal::events.push_back({mock_hal::EventKind::McpwmGpioInit, unit, signal, static_cast<float>(pin)});
-    return mock_hal::gpio_init_result;
+    if (mock_hal::gpio_init_result != ESP_OK)
+        return mock_hal::gpio_init_result;
+    const auto timer = static_cast<std::size_t>(signal) / 2U;
+    if (timer < mock_hal::pwm_timers[unit].size())
+    {
+        const auto &pwm = mock_hal::pwm_timers[unit][timer];
+        const auto channel = static_cast<std::size_t>(signal) % 2U;
+        if (pwm.highTicksForCompare(pwm.active_compare[channel]) != 0U)
+            ++mock_hal::unsafe_routes;
+        mock_hal::pwm_routes[pin] = {unit, signal};
+    }
+    return ESP_OK;
 }
 
 inline esp_err_t mcpwm_init(mcpwm_unit_t unit, mcpwm_timer_t timer, const mcpwm_config_t *config)
 {
     if (mock_hal::mcpwm_init_result != ESP_OK)
         return mock_hal::mcpwm_init_result;
-    mock_hal::duties[unit][timer][MCPWM_OPR_A] = config->cmpr_a;
-    mock_hal::duties[unit][timer][MCPWM_OPR_B] = config->cmpr_b;
+
+    auto &pwm = mock_hal::pwm_timers[unit][timer];
+    if (mock_hal::running[unit][timer])
+        ++mock_hal::active_reinitializations;
+    else
+        pwm.active_resolution_hz = pwm.resolution_hz;
+    pwm.stop_pending = false;
     mock_hal::running[unit][timer] = true;
-    mock_hal::frequencies[unit][timer] = static_cast<uint32_t>(config->frequency);
+    pwm.period_register = (pwm.resolution_hz / config->frequency - 1U) & 0xffffU;
+    pwm.mode = config->counter_mode;
+    pwm.duty_mode_inverted = config->duty_mode == MCPWM_DUTY_MODE_1;
+    pwm.shadow_compare = {pwm.compareForDuty(config->cmpr_a), pwm.compareForDuty(config->cmpr_b)};
+    mock_hal::duties[unit][timer] = {config->cmpr_a, config->cmpr_b};
     mock_hal::events.push_back({mock_hal::EventKind::McpwmInit, unit, timer,
                                 static_cast<float>(config->frequency)});
     return ESP_OK;
 }
 
 inline esp_err_t mcpwm_deadtime_enable(mcpwm_unit_t unit, mcpwm_timer_t timer,
-                                      mcpwm_deadtime_type_t, uint32_t, uint32_t)
+                                      mcpwm_deadtime_type_t, uint32_t red, uint32_t fed)
 {
+    mock_hal::deadtime_red = red;
+    mock_hal::deadtime_fed = fed;
     mock_hal::events.push_back({mock_hal::EventKind::DeadtimeEnable, unit, timer});
     return ESP_OK;
 }
@@ -337,8 +494,9 @@ inline esp_err_t mcpwm_deadtime_disable(mcpwm_unit_t unit, mcpwm_timer_t timer)
 }
 
 inline esp_err_t mcpwm_set_duty_type(mcpwm_unit_t unit, mcpwm_timer_t timer,
-                                     mcpwm_operator_t op, mcpwm_duty_type_t)
+                                     mcpwm_operator_t op, mcpwm_duty_type_t mode)
 {
+    mock_hal::pwm_timers[unit][timer].duty_mode_inverted = mode == MCPWM_DUTY_MODE_1;
     mock_hal::events.push_back({mock_hal::EventKind::DutyType, unit, timer, static_cast<float>(op)});
     return ESP_OK;
 }
@@ -355,6 +513,8 @@ inline esp_err_t mcpwm_set_duty(mcpwm_unit_t unit, mcpwm_timer_t timer,
     if (result != ESP_OK)
         return result;
     mock_hal::duties[unit][timer][op] = duty;
+    auto &pwm = mock_hal::pwm_timers[unit][timer];
+    pwm.shadow_compare[op] = pwm.compareForDuty(duty);
     mock_hal::events.push_back({mock_hal::EventKind::Duty, op, timer, duty});
     if (mock_hal::duty_hook)
     {
@@ -369,7 +529,17 @@ inline esp_err_t mcpwm_start(mcpwm_unit_t unit, mcpwm_timer_t timer)
 {
     if (mock_hal::start_result != ESP_OK)
         return mock_hal::start_result;
+    auto &pwm = mock_hal::pwm_timers[unit][timer];
+    if (!mock_hal::running[unit][timer])
+        pwm.active_resolution_hz = pwm.resolution_hz;
+    pwm.stop_pending = false;
     mock_hal::running[unit][timer] = true;
+    if (mock_hal::start_hook)
+    {
+        void (*hook)() = mock_hal::start_hook;
+        mock_hal::start_hook = nullptr;
+        hook();
+    }
     mock_hal::events.push_back({mock_hal::EventKind::McpwmStart, unit, timer});
     return ESP_OK;
 }
@@ -378,27 +548,50 @@ inline esp_err_t mcpwm_stop(mcpwm_unit_t unit, mcpwm_timer_t timer)
 {
     if (mock_hal::stop_result != ESP_OK)
         return mock_hal::stop_result;
-    mock_hal::running[unit][timer] = false;
+    if (mock_hal::running[unit][timer])
+        mock_hal::pwm_timers[unit][timer].stop_pending = true;
     mock_hal::events.push_back({mock_hal::EventKind::McpwmStop, unit, timer});
     return ESP_OK;
 }
 
-inline esp_err_t mcpwm_set_frequency(mcpwm_unit_t unit, mcpwm_timer_t timer, int frequency)
+inline esp_err_t mcpwm_timer_set_resolution(mcpwm_unit_t unit, mcpwm_timer_t timer, uint32_t resolution)
+{
+    if (mock_hal::resolution_result != ESP_OK)
+        return mock_hal::resolution_result;
+    constexpr uint32_t group_hz = 160000000U / 16U;
+    mock_hal::pwm_timers[unit][timer].resolution_hz = group_hz / (group_hz / resolution);
+    return ESP_OK;
+}
+
+inline esp_err_t mcpwm_set_frequency(mcpwm_unit_t unit, mcpwm_timer_t timer, uint32_t frequency)
 {
     if (mock_hal::frequency_result != ESP_OK)
         return mock_hal::frequency_result;
-    mock_hal::frequencies[unit][timer] = static_cast<uint32_t>(frequency);
+    auto &pwm = mock_hal::pwm_timers[unit][timer];
+    if (mock_hal::running[unit][timer])
+        ++mock_hal::live_period_writes;
+    const uint32_t previous = pwm.period_register + 1U;
+    const uint32_t ticks = pwm.resolution_hz / frequency;
+    pwm.period_register = (ticks - 1U) & 0xffffU;
+    for (std::size_t op = 0; op < pwm.shadow_compare.size(); ++op)
+    {
+        pwm.shadow_compare[op] = pwm.shadow_compare[op] * ticks / previous;
+        pwm.active_compare[op] = pwm.shadow_compare[op];
+    }
     return ESP_OK;
 }
 
 inline uint32_t mcpwm_get_frequency(mcpwm_unit_t unit, mcpwm_timer_t timer)
 {
-    return mock_hal::frequencies[unit][timer];
+    const auto &pwm = mock_hal::pwm_timers[unit][timer];
+    return pwm.resolution_hz / (pwm.period_register + 1U);
 }
 
 inline float mcpwm_get_duty(mcpwm_unit_t unit, mcpwm_timer_t timer, mcpwm_operator_t op)
 {
-    return mock_hal::duties[unit][timer][op];
+    const auto &pwm = mock_hal::pwm_timers[unit][timer];
+    return 100.0f * static_cast<float>(pwm.shadow_compare[op]) /
+           static_cast<float>(pwm.period_register + 1U);
 }
 
 inline esp_err_t mcpwm_fault_init(mcpwm_unit_t unit, mcpwm_fault_input_level_t level,
@@ -415,6 +608,12 @@ inline esp_err_t mcpwm_fault_set_oneshot_mode(mcpwm_unit_t unit, mcpwm_timer_t t
                                                mcpwm_output_action_t action_b)
 {
     (void)signal;
+    if (mock_hal::fault_mode_hook)
+    {
+        void (*hook)() = mock_hal::fault_mode_hook;
+        mock_hal::fault_mode_hook = nullptr;
+        hook();
+    }
     mock_hal::events.push_back({mock_hal::EventKind::HardwareFaultMode, unit, timer,
                                 static_cast<float>(action_a * 10 + action_b)});
     return mock_hal::fault_mode_result;
@@ -486,6 +685,58 @@ inline esp_err_t esp_timer_delete(esp_timer_handle_t timer)
 }
 
 using gpio_num_t = int;
+constexpr int GPIO_MODE_OUTPUT = OUTPUT;
+constexpr int GPIO_MODE_INPUT = INPUT;
+constexpr int GPIO_MODE_DISABLE = -1;
+constexpr int GPIO_PULLUP_DISABLE = 0;
+constexpr int GPIO_PULLDOWN_ENABLE = 1;
+inline esp_err_t gpio_set_level(gpio_num_t pin, uint32_t level)
+{
+    if (mock_hal::gpio_level_result == ESP_OK)
+    {
+        mock_hal::pin_levels[pin] = static_cast<int>(level);
+        mock_hal::events.push_back({mock_hal::EventKind::GpioLatch, pin, static_cast<int>(level)});
+    }
+    return mock_hal::gpio_level_result;
+}
+struct gpio_config_t
+{
+    uint64_t pin_bit_mask;
+    int mode;
+    int pull_up_en;
+    int pull_down_en;
+};
+
+inline esp_err_t gpio_config(const gpio_config_t *config)
+{
+    const int failing_pin = mock_hal::gpio_release_failure_pin;
+    if (config->mode == GPIO_MODE_INPUT && failing_pin >= 0 &&
+        (config->pin_bit_mask & (UINT64_C(1) << static_cast<unsigned>(failing_pin))))
+        return -1;
+    for (uint32_t pin = 0U; pin < 64U; ++pin)
+    {
+        if ((config->pin_bit_mask & (UINT64_C(1) << pin)) == 0)
+            continue;
+        const auto number = static_cast<int>(pin);
+        mock_hal::pin_modes[number] = config->mode;
+        mock_hal::pin_pulls[number] = {config->pull_up_en != 0, config->pull_down_en != 0};
+        if (config->mode == GPIO_MODE_INPUT)
+            mock_hal::events.push_back({mock_hal::EventKind::GpioInputRelease, number});
+    }
+    return ESP_OK;
+}
+
+inline esp_err_t gpio_reset_pin(gpio_num_t pin)
+{
+    mock_hal::events.push_back({mock_hal::EventKind::GpioReset, pin});
+    if (pin == mock_hal::gpio_release_failure_pin)
+        return -1;
+    // ESP-IDF reset disconnects output drive and turns on the internal pull-up.
+    mock_hal::pin_modes[pin] = GPIO_MODE_DISABLE;
+    mock_hal::pin_pulls[pin] = {true, false};
+    return ESP_OK;
+}
+
 inline int gpio_get_level(gpio_num_t pin)
 {
     const auto it = mock_hal::pin_levels.find(pin);

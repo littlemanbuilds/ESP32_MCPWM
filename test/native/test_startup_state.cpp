@@ -14,6 +14,7 @@
 #include <cmath>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -187,7 +188,7 @@ void testHiZSetupIsInactiveWithoutEnabledWindow()
     motor.setup(hardware(), behavior(FreewheelMode::HiZ));
 
     checkState(outputState(), {LOW, 0.0f, 0.0f, false});
-    const int en_low = findEvent(mock_hal::EventKind::DigitalWrite, 8, LOW);
+    const int en_low = findEvent(mock_hal::EventKind::GpioLatch, 8, LOW);
     const int en_output = findEvent(mock_hal::EventKind::PinMode, 8, OUTPUT);
     CHECK(en_low >= 0);
     CHECK(en_output >= 0);
@@ -321,6 +322,7 @@ void testZeroDriveIsExplicitAndDitherZeroUsesConfiguredCoast()
     CHECK(zero_percent.error == MotorOperationError::InvalidCommand);
     checkState(outputState(), before_zero);
 
+    CHECK(hi_z_motor.setup(MotorMCPWMConfig{}).error == MotorSetupError::InvalidPwmPin);
     mock_hal::reset();
     HBridgeMotor freewheel_motor;
     freewheel_motor.setup(hardware(), behavior(FreewheelMode::DitherBrake, 0, true));
@@ -328,6 +330,7 @@ void testZeroDriveIsExplicitAndDitherZeroUsesConfiguredCoast()
     freewheel_motor.setFreewheel();
     checkState(outputState(), {LOW, 0.0f, 0.0f, false});
 
+    CHECK(freewheel_motor.setup(MotorMCPWMConfig{}).error == MotorSetupError::InvalidPwmPin);
     mock_hal::reset();
     HBridgeMotor enabled_coast_motor;
     enabled_coast_motor.setup(hardware(), behavior(FreewheelMode::DitherBrake, 0, false));
@@ -351,6 +354,7 @@ void testSameFreewheelModeIsTrueNoOp()
     CHECK(mock_hal::last_timer->timeout_us == timeout_before);
     CHECK(mock_hal::events.empty());
 
+    CHECK(motor.setup(MotorMCPWMConfig{}).error == MotorSetupError::InvalidPwmPin);
     mock_hal::reset();
     HBridgeMotor unconfigured;
     unconfigured.setFreewheelMode(FreewheelMode::HiZ);
@@ -673,7 +677,7 @@ void testCoastPreservesStoppedMcpwmState()
     CHECK(!mock_hal::running[MCPWM_UNIT_0][MCPWM_TIMER_0]);
 }
 
-void testClearDiscardsPendingFaultWork()
+void testClearPreservesPendingFaultNotification()
 {
     mock_hal::reset();
     fault_callback_count = 0;
@@ -692,7 +696,7 @@ void testClearDiscardsPendingFaultWork()
     checkState(outputState(), {LOW, 0.0f, 0.0f, false});
 
     motor.pollFaults();
-    CHECK(fault_callback_count == 0);
+    CHECK(fault_callback_count == 1);
     checkState(outputState(), {LOW, 0.0f, 0.0f, false});
 }
 
@@ -725,7 +729,7 @@ void testLevelFollowAllFaultActions()
 
         mock_hal::pin_levels[10] = LOW;
         mock_hal::invokeInterrupt(10);
-        CHECK(!motor.hasFault());
+        CHECK(motor.hasFault()); // Recovery remains inhibited until quiet polling succeeds.
         motor.pollFaults();
         CHECK(!motor.hasFault());
         checkState(outputState(), {LOW, 0.0f, 0.0f, false});
@@ -859,7 +863,9 @@ void testRuntimeFrequencyReconfiguration()
     CHECK(!failed.ok());
     CHECK(failed.changed);
     checkState(outputState(), {LOW, 0.0f, 0.0f, false});
-    CHECK(motor.status().output_mode == MotorOutputMode::Coast);
+    CHECK(motor.status().output_mode == MotorOutputMode::Disabled);
+    CHECK(!motor.status().mcpwm_running);
+    CHECK(motor.status().pwm_frequency_hz == 25000);
 }
 
 void testDriveFrequencyReconfigurationPublishesQuietState()
@@ -890,20 +896,28 @@ void testFrequencyReconfigurationFailureStatusIsTruthful()
         contained.reconfigureFrequency(25000);
     CHECK(frequency_failed.error == MotorOperationError::FrequencyChangeFailed);
     CHECK(frequency_failed.changed);
-    CHECK(contained.status().output_mode == MotorOutputMode::Coast);
+    CHECK(contained.status().output_mode == MotorOutputMode::Disabled);
+    CHECK(contained.status().pwm_frequency_hz == 20000);
+    CHECK(contained.readback().frequency_hz == 0U);
     checkState(outputState(), {LOW, 0.0f, 0.0f, false});
 
+    CHECK(contained.setup(MotorMCPWMConfig{}).error == MotorSetupError::InvalidPwmPin);
     mock_hal::reset();
     HBridgeMotor uncertain;
-    CHECK(uncertain.setup(hardware(-1), behavior(FreewheelMode::HiZ)).ok());
+    CHECK(uncertain.setup(hardware(), behavior(FreewheelMode::HiZ)).ok());
     CHECK(uncertain.drive(600, Dir::CCW).ok());
     mock_hal::duty_result = -1;
     const MotorOperationResult output_failed = uncertain.reconfigureFrequency(25000);
     CHECK(output_failed.error == MotorOperationError::HardwareWriteFailed);
     CHECK(output_failed.changed);
-    CHECK(uncertain.status().output_mode == MotorOutputMode::Uncertain);
+    CHECK(uncertain.status().output_mode == MotorOutputMode::Disabled);
+    CHECK(!uncertain.status().mcpwm_running);
+    CHECK(mock_hal::pwm_routes.empty());
+    CHECK(!uncertain.drive(500, Dir::CW).ok());
 
     mock_hal::duty_result = ESP_OK;
+    CHECK(uncertain.stop().ok());
+    CHECK(uncertain.start().ok());
     CHECK(uncertain.drive(500, Dir::CW).ok());
     CHECK(uncertain.status().output_mode == MotorOutputMode::DriveCW);
 }
@@ -1137,10 +1151,13 @@ void testRepeatedSetupContainmentFailuresTakePrecedence()
         duty_failure.setup(invalid, behavior(FreewheelMode::HiZ_Awake));
     CHECK(duty_result.error == MotorSetupError::ContainmentFailed);
     CHECK(duty_failure.status().setup_complete);
-    CHECK(duty_failure.status().output_mode == MotorOutputMode::Uncertain);
+    CHECK(duty_failure.status().output_mode == MotorOutputMode::Disabled);
     CHECK(duty_failure.readback().valid);
+    CHECK(mock_hal::pwm_routes.empty());
+    CHECK(!duty_failure.drive(500, Dir::CW).ok());
     mock_hal::duty_result = ESP_OK;
 
+    CHECK(duty_failure.setup(MotorMCPWMConfig{}).error == MotorSetupError::InvalidPwmPin);
     mock_hal::reset();
     HBridgeMotor stop_failure;
     CHECK(stop_failure.setup(without_en, behavior(FreewheelMode::HiZ_Awake)).ok());
@@ -1151,9 +1168,11 @@ void testRepeatedSetupContainmentFailuresTakePrecedence()
     CHECK(stop_setup.error == MotorSetupError::ContainmentFailed);
     CHECK(stop_failure.status().setup_complete);
     CHECK(stop_failure.status().mcpwm_running);
-    CHECK(stop_failure.status().output_mode == MotorOutputMode::Uncertain);
+    CHECK(stop_failure.status().recovery_inhibited);
+    CHECK(stop_failure.status().output_mode == MotorOutputMode::Disabled);
     mock_hal::stop_result = ESP_OK;
 
+    CHECK(stop_failure.setup(MotorMCPWMConfig{}).error == MotorSetupError::InvalidPwmPin);
     mock_hal::reset();
     HBridgeMotor en_contained;
     CHECK(en_contained.setup(hardware(), behavior(FreewheelMode::HiZ_Awake)).ok());
@@ -1166,6 +1185,7 @@ void testRepeatedSetupContainmentFailuresTakePrecedence()
     CHECK(mock_hal::pin_levels[8] == LOW);
     mock_hal::duty_result = ESP_OK;
 
+    CHECK(en_contained.setup(MotorMCPWMConfig{}).error == MotorSetupError::InvalidPwmPin);
     mock_hal::reset();
     HBridgeMotor deadtime_failure;
     MotorMCPWMConfig with_deadtime = hardware();
@@ -1179,6 +1199,7 @@ void testRepeatedSetupContainmentFailuresTakePrecedence()
     CHECK(deadtime_failure.status().output_mode == MotorOutputMode::Disabled);
     mock_hal::deadtime_disable_result = ESP_OK;
 
+    CHECK(deadtime_failure.setup(MotorMCPWMConfig{}).error == MotorSetupError::InvalidPwmPin);
     mock_hal::reset();
     mock_hal::pin_levels[12] = LOW;
     HBridgeMotor fault_teardown_failure;
@@ -1213,6 +1234,7 @@ void testDitherWriteFailureTerminatesAndContains()
     CHECK(motor.drive(500, Dir::CCW).ok());
     CHECK(motor.status().output_mode == MotorOutputMode::DriveCCW);
 
+    CHECK(motor.setup(MotorMCPWMConfig{}).error == MotorSetupError::InvalidPwmPin);
     mock_hal::reset();
     HBridgeMotor no_en;
     CHECK(no_en.setup(hardware(-1), behavior(FreewheelMode::DitherBrake, 256, true)).ok());
@@ -1245,6 +1267,7 @@ void testDitherTimerFailureTerminatesAndContains()
     CHECK(contained.drive(500, Dir::CCW).ok());
     CHECK(contained.status().output_mode == MotorOutputMode::DriveCCW);
 
+    CHECK(contained.setup(MotorMCPWMConfig{}).error == MotorSetupError::InvalidPwmPin);
     mock_hal::reset();
     HBridgeMotor uncertain;
     CHECK(uncertain
@@ -1407,7 +1430,7 @@ void testStructuredResultsAndReadback()
     const MotorHardwareReadback readback = motor.readback();
     CHECK(readback.valid);
     CHECK(readback.frequency_hz == 20000U);
-    CHECK_NEAR(readback.duty_a_percent, status.commanded_a_percent, 0.001f);
+    CHECK_NEAR(readback.duty_a_percent, 50.0f, 0.001f);
     CHECK_NEAR(readback.duty_b_percent, status.commanded_b_percent, 0.001f);
     CHECK(readback.enable_control);
     CHECK(readback.enable_asserted);
@@ -1441,6 +1464,7 @@ void testLifecycleAndHardwareWriteFailuresAreReported()
     CHECK(!failed_stop.ok());
     CHECK(failed_stop.error == MotorOperationError::HardwareStopFailed);
     CHECK(motor.status().mcpwm_running);
+    mock_hal::stop_result = ESP_OK;
 }
 
 void testHardwareFaultOneShotConfigurationAndRearm()
@@ -1590,6 +1614,470 @@ void testFrequencyReadbackTracksSuccessfulReconfiguration()
     CHECK(motor.status().pwm_frequency_hz == 25000);
 }
 
+void testCenterAlignedWaveformUsesRequestedFrequency()
+{
+    mock_hal::reset();
+    HBridgeMotor motor;
+    auto hw = hardware();
+    hw.counter = MCPWM_UP_DOWN_COUNTER;
+    const auto &timer = mock_hal::pwm_timers[MCPWM_UNIT_0][MCPWM_TIMER_0];
+    CHECK(motor.setup(hw, behavior(FreewheelMode::HiZ), faultConfig(FaultAction::Coast),
+                      MotorCaptureConfig{}).ok());
+    CHECK(timer.mode == MCPWM_UP_DOWN_COUNTER);
+    CHECK(timer.active_resolution_hz == 20000U * timer.cycleTicks());
+    CHECK(timer.resolution_hz == 2000000U);
+    CHECK(timer.period_register == 50U);
+    CHECK(motor.readback().frequency_hz == 20000U);
+    CHECK(timer.highTicks(mock_hal::duties[0][0][MCPWM_OPR_A]) == 0U);
+    CHECK(timer.highTicks(mock_hal::duties[0][0][MCPWM_OPR_B]) == 0U);
+    CHECK(!motor.readback().enable_asserted);
+
+    CHECK(motor.setSpeed(hw.input_max, Dir::CW).ok());
+    CHECK(timer.highTicks(mock_hal::duties[0][0][MCPWM_OPR_A]) == timer.cycleTicks());
+    CHECK(timer.highTicks(mock_hal::duties[0][0][MCPWM_OPR_B]) == 0U);
+    CHECK(motor.setSpeed(hw.input_max / 2 + 1, Dir::CW).ok());
+    CHECK(timer.highTicks(mock_hal::duties[0][0][MCPWM_OPR_A]) == 50U);
+
+    CHECK(motor.reconfigureFrequency(25000).ok());
+    CHECK(timer.period_register == 40U);
+    CHECK(timer.active_resolution_hz == 25000U * timer.cycleTicks());
+    CHECK(motor.readback().frequency_hz == 25000U);
+    CHECK(motor.status().pwm_frequency_hz == 25000);
+    CHECK(timer.highTicks(mock_hal::duties[0][0][MCPWM_OPR_A]) == 0U);
+    CHECK(!motor.readback().enable_asserted);
+
+    CHECK(motor.setSpeed(hw.input_max, Dir::CW).ok());
+    mock_hal::pin_levels[10] = HIGH;
+    mock_hal::invokeInterrupt(10);
+    motor.pollFaults();
+    CHECK(timer.highTicks(mock_hal::duties[0][0][MCPWM_OPR_A]) == 0U);
+    CHECK(!motor.readback().enable_asserted);
+    CHECK(motor.disableOutputs().ok());
+    CHECK(!motor.readback().enable_asserted);
+}
+
+void testFrequencyModeBoundariesAndResolutionFailure()
+{
+    mock_hal::reset();
+    HBridgeMotor motor;
+    auto hw = hardware();
+    const auto &timer = mock_hal::pwm_timers[MCPWM_UNIT_0][MCPWM_TIMER_0];
+    hw.counter = MCPWM_UP_DOWN_COUNTER;
+    hw.pwm_freq_hz = 15;
+    CHECK(motor.setup(hw, behavior(FreewheelMode::HiZ)).error == MotorSetupError::InvalidPwmFrequency);
+    CHECK(!hasEvent(mock_hal::EventKind::McpwmInit));
+
+    hw.pwm_freq_hz = 16;
+    CHECK(motor.setup(hw, behavior(FreewheelMode::HiZ)).ok());
+    CHECK(timer.period_register == 62499U);
+    CHECK(motor.readback().frequency_hz == 16U);
+    CHECK(motor.reconfigureFrequency(500000).ok());
+    CHECK(timer.cycleTicks() == 4U);
+    CHECK(motor.reconfigureFrequency(500001).error == MotorOperationError::InvalidCommand);
+    CHECK(timer.cycleTicks() == 4U);
+
+    // The nearest waveform can be on either side of a non-exact request.
+    CHECK(motor.reconfigureFrequency(19000).ok());
+    CHECK(timer.period_register == 53U);
+    CHECK(motor.readback().frequency_hz == 18867U);
+    CHECK(motor.reconfigureFrequency(19150).ok());
+    CHECK(timer.period_register == 52U);
+    CHECK(motor.readback().frequency_hz == 19230U);
+    CHECK(motor.reconfigureFrequency(333334).ok());
+    CHECK(timer.period_register == 3U);
+    CHECK(motor.readback().frequency_hz == 333333U);
+
+    for (const auto counter : {MCPWM_UP_COUNTER, MCPWM_DOWN_COUNTER})
+    {
+        hw.counter = counter;
+        hw.pwm_freq_hz = 20000;
+        CHECK(motor.setup(hw, behavior(FreewheelMode::HiZ)).ok());
+        CHECK(timer.mode == counter);
+        CHECK(timer.resolution_hz == 1000000U);
+        CHECK(timer.active_resolution_hz == 1000000U);
+        CHECK(timer.cycleTicks() == 50U);
+        CHECK(motor.reconfigureFrequency(25000).ok());
+        CHECK(timer.cycleTicks() == 40U);
+    }
+
+    hw.counter = MCPWM_FREEZE_COUNTER;
+    CHECK(motor.setup(hw, behavior(FreewheelMode::HiZ)).error == MotorSetupError::InvalidPwmFrequency);
+
+    hw.counter = MCPWM_UP_DOWN_COUNTER;
+    mock_hal::resolution_result = -1;
+    CHECK(motor.setup(hw, behavior(FreewheelMode::HiZ)).error == MotorSetupError::HardwareInitFailed);
+    CHECK(!mock_hal::running[0][0]);
+    CHECK(mock_hal::pin_levels[hw.en_pin] == LOW);
+
+    mock_hal::resolution_result = ESP_OK;
+    mock_hal::start_result = -1;
+    CHECK(motor.setup(hw, behavior(FreewheelMode::HiZ)).error == MotorSetupError::HardwareInitFailed);
+    CHECK(!mock_hal::running[0][0]);
+    CHECK(mock_hal::pin_levels[hw.en_pin] == LOW);
+}
+
+void testImmediateLowFrequencySetupAndReuse()
+{
+    mock_hal::reset();
+    HBridgeMotor owner;
+    auto hw = hardware(-1);
+    hw.pwm_freq_hz = 16;
+    hw.counter = MCPWM_UP_DOWN_COUNTER;
+    const auto options = behavior(FreewheelMode::HiZ_Awake);
+    CHECK(owner.setup(hw, options).ok());
+    auto &timer = mock_hal::pwm_timers[0][0];
+    for (const auto mode : {MCPWM_UP_DOWN_COUNTER, MCPWM_DOWN_COUNTER, MCPWM_UP_COUNTER})
+    {
+        CHECK(owner.drive(600, Dir::CW).ok());
+        delayMicroseconds(100);
+        CHECK(timer.active_compare[0] != timer.shadow_compare[0] ||
+              timer.highTicksForCompare(timer.active_compare[0]) > 0U);
+        timer.phase_ticks = 1U;
+        timer.events |= mock_hal::stopped_event; // Stale event from an earlier cycle.
+        const uint32_t before = micros();
+        hw.counter = mode;
+        CHECK(owner.setup(hw, options).ok());
+        CHECK(micros() - before > 60000U);
+        CHECK(timer.mode == mode);
+        CHECK(mock_hal::active_reinitializations == 0U);
+        CHECK(mock_hal::unsafe_routes == 0U);
+        CHECK(owner.readback().frequency_hz == 16U);
+    }
+
+    mock_hal::suppress_timer_stop = true;
+    CHECK(owner.setup(hw, options).error == MotorSetupError::ContainmentFailed);
+    CHECK(owner.status().mcpwm_running);
+    CHECK(owner.status().recovery_inhibited);
+    CHECK(!owner.drive(600, Dir::CCW).ok());
+    CHECK(mock_hal::pwm_routes.empty());
+    CHECK(mock_hal::pin_levels[hw.lpwm_pin] == LOW);
+    CHECK(mock_hal::pin_levels[hw.rpwm_pin] == LOW);
+    CHECK(timer.stop_pending);
+    HBridgeMotor replacement;
+    CHECK(replacement.setup(hw, options).error == MotorSetupError::ResourceConflict);
+
+    mock_hal::suppress_timer_stop = false;
+    delayMicroseconds(63000U); // Event arrives after timeout, before retry.
+    CHECK(!mock_hal::running[0][0]);
+    CHECK(!timer.stop_pending);
+    auto invalid = hw;
+    invalid.lpwm_pin = -1;
+    CHECK(owner.setup(invalid, options).error == MotorSetupError::InvalidPwmPin);
+    CHECK(replacement.setup(hw, options).ok());
+    CHECK(mock_hal::active_reinitializations == 0U);
+    CHECK(mock_hal::unsafe_routes == 0U);
+}
+
+void testRetuneSeparatesActiveAndPendingOutput()
+{
+    for (const int enable_pin : {-1, 8})
+    {
+        mock_hal::reset();
+        HBridgeMotor motor;
+        auto hw = hardware(enable_pin);
+        hw.counter = MCPWM_UP_DOWN_COUNTER;
+        hw.pwm_freq_hz = 16;
+        CHECK(motor.setup(hw, behavior(FreewheelMode::HiZ_Awake)).ok());
+        auto &timer = mock_hal::pwm_timers[0][0];
+        CHECK(motor.drive(700, Dir::CW).ok());
+        delayMicroseconds(63000U);
+        CHECK(timer.active_compare[0] > 0U);
+        CHECK(motor.drive(700, Dir::CCW).ok());
+        CHECK(timer.shadow_compare[1] > 0U);
+        CHECK(timer.active_compare[1] == 0U);
+        if (enable_pin < 0)
+        {
+            const auto event_count = mock_hal::events.size();
+            CHECK(motor.reconfigureFrequency(25000).error == MotorOperationError::Unsupported);
+            CHECK(mock_hal::events.size() == event_count);
+            CHECK(timer.shadow_compare[1] > 0U);
+            CHECK(motor.status().pwm_frequency_hz == 16);
+            CHECK(motor.stop().ok());
+            CHECK(motor.reconfigureFrequency(25000).ok());
+            CHECK(!motor.status().mcpwm_running);
+            CHECK(mock_hal::pwm_routes.empty());
+            CHECK(motor.start().ok());
+            CHECK(motor.readback().frequency_hz == 25000U);
+            CHECK(mock_hal::unsafe_routes == 0U);
+            continue;
+        }
+        mock_hal::observed_enable_pin = enable_pin;
+        CHECK(motor.reconfigureFrequency(25000).ok());
+        CHECK(mock_hal::live_period_writes == 0U);
+        CHECK(mock_hal::unsafe_routes == 0U);
+        CHECK(timer.active_compare[0] == 0U);
+        CHECK(timer.active_compare[1] == 0U);
+        CHECK(!motor.readback().enable_asserted);
+        CHECK(motor.readback().frequency_hz == 25000U);
+
+        CHECK(motor.drive(400, Dir::CCW).ok());
+        delayMicroseconds(50);
+        CHECK(timer.highTicksForCompare(timer.active_compare[1]) > 0U);
+        mock_hal::start_result = -1;
+        CHECK(motor.reconfigureFrequency(16).error == MotorOperationError::HardwareStartFailed);
+        CHECK(motor.status().pwm_frequency_hz == 16);
+        CHECK(motor.readback().frequency_hz == 0U);
+        CHECK(!motor.status().mcpwm_running);
+        CHECK(mock_hal::pwm_routes.empty());
+        mock_hal::start_result = ESP_OK;
+        CHECK(motor.start().ok());
+        CHECK(motor.readback().frequency_hz == 16U);
+        CHECK(timer.active_compare[0] == 0U);
+        CHECK(timer.active_compare[1] == 0U);
+        CHECK(mock_hal::unsafe_routes == 0U);
+        CHECK(mock_hal::live_period_writes == 0U);
+
+        CHECK(motor.stop().ok());
+        CHECK(motor.reconfigureFrequency(25000).ok());
+        CHECK(!motor.status().mcpwm_running);
+        CHECK(mock_hal::pwm_routes.empty());
+        CHECK(motor.start().ok());
+        CHECK(motor.readback().frequency_hz == 25000U);
+
+        CHECK(motor.setHardBrake().ok());
+        delayMicroseconds(50);
+        CHECK(timer.highTicksForCompare(timer.active_compare[0]) == timer.cycleTicks());
+        CHECK(timer.highTicksForCompare(timer.active_compare[1]) == timer.cycleTicks());
+        CHECK(motor.reconfigureFrequency(20000).ok());
+        CHECK(mock_hal::remaps_while_enabled == 0U);
+    }
+}
+
+void testRetunePreservesFaultOwnership()
+{
+    mock_hal::reset();
+    HBridgeMotor motor;
+    CHECK(motor.setup(hardware(), behavior(FreewheelMode::HiZ), faultConfig(FaultAction::Coast),
+                      MotorCaptureConfig{}).ok());
+    CHECK(motor.drive(512, Dir::CW).ok());
+    mock_hal::pin_levels[10] = HIGH;
+    mock_hal::invokeInterrupt(10);
+    const auto events = mock_hal::events.size();
+    CHECK(motor.reconfigureFrequency(25000).error == MotorOperationError::FaultActive);
+    CHECK(mock_hal::events.size() == events);
+    CHECK(motor.pollFaults().ok());
+    mock_hal::pin_levels[10] = LOW;
+    CHECK(motor.clearFault().ok());
+
+    mock_hal::pwm_wait_hook = []() {
+        mock_hal::pin_levels[10] = HIGH;
+        mock_hal::invokeInterrupt(10);
+    };
+    CHECK(motor.reconfigureFrequency(25000).error == MotorOperationError::FaultActive);
+    CHECK(motor.status().pwm_frequency_hz == 20000);
+    CHECK(mock_hal::pwm_routes.empty());
+    CHECK(!motor.readback().enable_asserted);
+
+    CHECK(motor.setup(hardware(), behavior(FreewheelMode::HiZ), MotorSafetyConfig{},
+                      MotorCaptureConfig{}, hardwareFaultConfig(HardwareFaultMode::OneShot)).ok());
+    const auto events_with_fault_config = mock_hal::events.size();
+    CHECK(motor.reconfigureFrequency(25000).error == MotorOperationError::Unsupported);
+    CHECK(mock_hal::events.size() == events_with_fault_config);
+    mock_hal::pin_levels[12] = HIGH;
+    mock_hal::invokeInterrupt(12);
+    CHECK(motor.reconfigureFrequency(25000).error == MotorOperationError::FaultActive);
+    CHECK(motor.status().pwm_frequency_hz == 20000);
+}
+
+void testCounterModesAndElectricalEndpointsInModel()
+{
+    for (const auto mode : {MCPWM_UP_COUNTER, MCPWM_DOWN_COUNTER, MCPWM_UP_DOWN_COUNTER})
+    {
+        mock_hal::reset();
+        HBridgeMotor motor;
+        auto hw = hardware();
+        hw.counter = mode;
+        hw.pwm_freq_hz = 500000;
+        CHECK(motor.setup(hw, behavior(FreewheelMode::HiZ_Awake)).ok());
+        auto &timer = mock_hal::pwm_timers[0][0];
+        CHECK(timer.highTicksForCompare(timer.active_compare[0]) == 0U);
+        CHECK(timer.highTicksForCompare(timer.active_compare[1]) == 0U);
+        CHECK(motor.drive(hw.input_max, Dir::CW).ok());
+        delayMicroseconds(3);
+        CHECK(timer.highTicksForCompare(timer.active_compare[0]) == timer.cycleTicks());
+        CHECK(timer.highTicksForCompare(timer.active_compare[1]) == 0U);
+        CHECK(motor.readback().duty_a_percent == 100.0f);
+        CHECK(motor.readback().duty_b_percent == 0.0f);
+        CHECK(motor.reconfigureFrequency(500001).error == MotorOperationError::InvalidCommand);
+        CHECK(motor.reconfigureFrequency(15).error == MotorOperationError::InvalidCommand);
+        CHECK(motor.reconfigureFrequency(400001).ok());
+        CHECK(motor.readback().frequency_hz == 333333U);
+        CHECK(motor.reconfigureFrequency(440000).ok());
+        CHECK(motor.readback().frequency_hz == 500000U);
+        CHECK(motor.reconfigureFrequency(20000).ok());
+        CHECK(motor.drive(hw.input_max / 2 + 1, Dir::CCW).ok());
+        delayMicroseconds(60);
+        CHECK(timer.highTicksForCompare(timer.active_compare[1]) * 2U == timer.cycleTicks());
+        CHECK(motor.readback().duty_b_percent == 50.0f);
+        CHECK(mock_hal::unsafe_routes == 0U);
+    }
+}
+
+void checkPercentMatchesRaw(HBridgeMotor &motor, Dir direction, float percent, int expected_count)
+{
+    const bool cw = direction == Dir::CW;
+    const auto channel = cw ? MCPWM_OPR_A : MCPWM_OPR_B;
+    const auto &timer = mock_hal::pwm_timers[0][0];
+    CHECK(motor.drivePercent(percent, direction).ok());
+    delayMicroseconds(63000U);
+    const auto status = motor.status();
+    const float demand = cw ? status.commanded_a_percent : status.commanded_b_percent;
+    const auto mapped_count = std::lround(static_cast<double>(demand) * motor.getMaxPwmInput() / 100.0);
+    CHECK(mapped_count == expected_count);
+    const auto percent_compares = timer.active_compare;
+    const auto percent_readback = motor.readback();
+
+    if (status.pwm_frequency_hz == 500000 && (expected_count == 511 || expected_count == 512))
+    {
+        const bool half_output = timer.mode == MCPWM_UP_DOWN_COUNTER || expected_count == 512;
+        const uint32_t expected_compare = (timer.mode == MCPWM_DOWN_COUNTER) != half_output ? 1U : 0U;
+        const auto idle_channel = cw ? MCPWM_OPR_B : MCPWM_OPR_A;
+        CHECK(percent_compares[channel] == expected_compare);
+        CHECK(timer.highTicksForCompare(percent_compares[channel]) ==
+              (half_output ? timer.cycleTicks() / 2U : 0U));
+        CHECK(timer.highTicksForCompare(percent_compares[idle_channel]) == 0U);
+        CHECK_NEAR(cw ? percent_readback.duty_a_percent : percent_readback.duty_b_percent,
+                   half_output ? 50.0f : 0.0f, 0.001f);
+    }
+
+    CHECK(motor.coast().ok());
+    CHECK(motor.drive(expected_count, direction).ok());
+    delayMicroseconds(63000U);
+    CHECK(timer.active_compare == percent_compares);
+    const auto raw_readback = motor.readback();
+    CHECK_NEAR(raw_readback.duty_a_percent, percent_readback.duty_a_percent, 0.001f);
+    CHECK_NEAR(raw_readback.duty_b_percent, percent_readback.duty_b_percent, 0.001f);
+}
+
+void testPercentMidpointAndRawEquivalence()
+{
+    for (const auto mode : {MCPWM_UP_COUNTER, MCPWM_DOWN_COUNTER, MCPWM_UP_DOWN_COUNTER})
+    {
+        for (const int hz : {500000, 20000, 16})
+        {
+            mock_hal::reset();
+            HBridgeMotor motor;
+            auto hw = hardware();
+            hw.counter = mode;
+            hw.pwm_freq_hz = hz;
+            CHECK(motor.setup(hw).ok());
+            CHECK(motor.readback().frequency_hz == static_cast<uint32_t>(hz));
+
+            for (const auto direction : {Dir::CW, Dir::CCW})
+            {
+                checkPercentMatchesRaw(motor, direction, 50.0f, 512);
+                checkPercentMatchesRaw(motor, direction, std::nextafter(50.0f, 0.0f), 511);
+                checkPercentMatchesRaw(motor, direction, std::nextafter(50.0f, 100.0f), 512);
+                checkPercentMatchesRaw(motor, direction, 25.0f, 256);
+                checkPercentMatchesRaw(motor, direction, 75.0f, 767);
+            }
+        }
+    }
+}
+
+void testPercentRangeAndOtherInputScales()
+{
+    mock_hal::reset();
+    HBridgeMotor motor;
+    auto hw = hardware();
+    hw.input_max = 10;
+    CHECK(motor.setup(hw).ok());
+    checkPercentMatchesRaw(motor, Dir::CW, std::nextafter(25.0f, 0.0f), 2);
+    checkPercentMatchesRaw(motor, Dir::CW, 25.0f, 3);
+    checkPercentMatchesRaw(motor, Dir::CW, std::nextafter(25.0f, 100.0f), 3);
+    checkPercentMatchesRaw(motor, Dir::CCW, std::numeric_limits<float>::min(), 1);
+    checkPercentMatchesRaw(motor, Dir::CCW, 100.0f, 10);
+    checkPercentMatchesRaw(motor, Dir::CCW, std::numeric_limits<float>::max(), 10);
+    const auto compares = mock_hal::pwm_timers[0][0].shadow_compare;
+    const auto state = outputState();
+    for (const float invalid : {0.0f, -1.0f, std::numeric_limits<float>::infinity(),
+                               std::numeric_limits<float>::quiet_NaN()})
+    {
+        CHECK(motor.drivePercent(invalid, Dir::CW).error == MotorOperationError::InvalidCommand);
+        CHECK(mock_hal::pwm_timers[0][0].shadow_compare == compares);
+        checkState(outputState(), state);
+    }
+    CHECK(motor.coast().ok());
+    delayMicroseconds(100U);
+    CHECK(motor.readback().duty_a_percent == 0.0f && motor.readback().duty_b_percent == 0.0f);
+
+    hw.input_max = 65535;
+    CHECK(motor.setup(hw).ok());
+    checkPercentMatchesRaw(motor, Dir::CW, 50.0f, 32768);
+    checkPercentMatchesRaw(motor, Dir::CW, 101.0f, 65535);
+}
+
+void testExactDutyEndpointsAcrossStopAndRestart()
+{
+    mock_hal::reset();
+    HBridgeMotor motor;
+    auto hw = hardware(-1);
+    hw.pwm_freq_hz = 16;
+    hw.input_max = 65535;
+    const auto options = behavior(FreewheelMode::HiZ_Awake);
+    CHECK(motor.setup(hw, options).ok());
+    auto &timer = mock_hal::pwm_timers[0][0];
+    CHECK(motor.drive(3, Dir::CW).ok());
+    delayMicroseconds(63000U);
+    CHECK(timer.active_compare[0] > 0U);
+    CHECK(motor.stop().ok());
+    CHECK(timer.shadow_compare[0] == 0U);
+    CHECK(motor.start().ok());
+    CHECK(timer.active_compare[0] == 0U);
+    CHECK(mock_hal::unsafe_routes == 0U);
+
+    hw.input_max = 97; // Multiplication by the cached ratio rounds below 100.
+    hw.pwm_freq_hz = 500000;
+    CHECK(motor.setup(hw, options).ok());
+    CHECK(motor.drive(hw.input_max, Dir::CW).ok());
+    delayMicroseconds(3);
+    CHECK(timer.highTicksForCompare(timer.active_compare[0]) == timer.cycleTicks());
+    CHECK(motor.readback().duty_a_percent == 100.0f);
+    CHECK(motor.status().commanded_a_percent == 100.0f);
+}
+
+void testFailedIsolationNeverClaimsDisabledOrReleasesOwnership()
+{
+    mock_hal::reset();
+    HBridgeMotor owner;
+    HBridgeMotor contender;
+    const auto hw = hardware(-1);
+    mock_hal::gpio_level_result = -1;
+    CHECK(owner.setup(hw).error == MotorSetupError::ContainmentFailed);
+    CHECK(owner.status().output_mode == MotorOutputMode::Uncertain);
+    CHECK(owner.setup(hw).error == MotorSetupError::ContainmentFailed);
+    CHECK(owner.status().output_mode == MotorOutputMode::Uncertain);
+    CHECK(contender.setup(hw).error == MotorSetupError::ResourceConflict);
+    mock_hal::gpio_level_result = ESP_OK;
+    CHECK(owner.setup(hw).ok());
+}
+
+void testRestartRequiresNewTimerEventsAndFaultFreeEnable()
+{
+    mock_hal::reset();
+    HBridgeMotor motor;
+    const auto options = behavior(FreewheelMode::HiZ_Awake);
+    CHECK(motor.setup(hardware(), options, faultConfig(FaultAction::Coast), MotorCaptureConfig{}).ok());
+    CHECK(motor.stop().ok());
+    mock_hal::suppress_timer_empty = true;
+    CHECK(motor.start().error == MotorOperationError::HardwareStartFailed);
+    CHECK(!motor.status().mcpwm_running);
+    CHECK(mock_hal::pwm_routes.empty());
+    CHECK(!motor.readback().enable_asserted);
+
+    mock_hal::suppress_timer_empty = false;
+    mock_hal::pwm_wait_hook = []() {
+        mock_hal::pin_levels[10] = HIGH;
+        mock_hal::invokeInterrupt(10);
+    };
+    CHECK(motor.start().error == MotorOperationError::FaultActive);
+    CHECK(!motor.readback().enable_asserted);
+    CHECK(!motor.status().mcpwm_running);
+    CHECK(mock_hal::pwm_routes.empty());
+    CHECK(motor.status().output_mode == MotorOutputMode::Disabled);
+    CHECK(motor.pollFaults().ok());
+}
+
 void testPollFaultsIsAvailableThroughInterface()
 {
     mock_hal::reset();
@@ -1604,6 +2092,370 @@ void testPollFaultsIsAvailableThroughInterface()
     mock_hal::invokeInterrupt(10);
     driver->pollFaults();
     checkFaultActionState(FaultAction::Coast);
+}
+void checkReleasedPin(int pin)
+{
+    CHECK(!mock_hal::pin_pulls.at(pin).first);
+    CHECK(mock_hal::pin_modes.at(pin) == GPIO_MODE_INPUT);
+    CHECK(mock_hal::pin_pulls.at(pin).second);
+    CHECK(mock_hal::pwm_routes.count(pin) == 0);
+}
+
+void testReleasedMotorPins(bool with_enable)
+{
+    mock_hal::reset();
+    const auto hw = hardware(with_enable ? 8 : -1);
+    for (const bool reuse : {false, true})
+    {
+        {
+            HBridgeMotor motor;
+            CHECK(motor.setup(hw).ok());
+            CHECK(!mock_hal::pin_pulls.at(hw.lpwm_pin).second);
+            CHECK(!mock_hal::pin_pulls.at(hw.rpwm_pin).second);
+            CHECK(motor.drive(600, Dir::CW).ok());
+            if (reuse)
+            {
+                CHECK(mock_hal::pwm_routes.at(hw.lpwm_pin).second == hw.sig_l);
+                CHECK(mock_hal::pwm_routes.at(hw.rpwm_pin).second == hw.sig_r);
+                if (with_enable)
+                {
+                    CHECK(mock_hal::pin_modes.at(hw.en_pin) == OUTPUT);
+                    CHECK(mock_hal::pin_levels.at(hw.en_pin) == HIGH);
+                    CHECK(!mock_hal::pin_pulls.at(hw.en_pin).second);
+                }
+            }
+            CHECK(motor.stop().ok());
+            for (const int pin : {hw.lpwm_pin, hw.rpwm_pin, hw.en_pin})
+            {
+                if (pin < 0)
+                    continue;
+                CHECK(mock_hal::pin_modes.at(pin) == OUTPUT);
+                CHECK(mock_hal::pin_levels.at(pin) == LOW);
+                CHECK(!mock_hal::pin_pulls.at(pin).first);
+                CHECK(!mock_hal::pin_pulls.at(pin).second);
+                CHECK(mock_hal::pwm_routes.count(pin) == 0);
+            }
+            HBridgeMotor contender;
+            CHECK(contender.setup(hw).error == MotorSetupError::ResourceConflict);
+            mock_hal::events.clear();
+        }
+        checkReleasedPin(hw.lpwm_pin);
+        checkReleasedPin(hw.rpwm_pin);
+        if (with_enable)
+        {
+            checkReleasedPin(hw.en_pin);
+            std::vector<int> released;
+            for (const auto &event : mock_hal::events)
+                if (event.kind == mock_hal::EventKind::GpioInputRelease)
+                    released.push_back(event.first);
+            CHECK((released == std::vector<int>{hw.lpwm_pin, hw.rpwm_pin, hw.en_pin}));
+        }
+    }
+}
+
+void testFailedTeardownRetainsOwnedPins()
+{
+    for (const bool with_enable : {false, true})
+    {
+        mock_hal::reset();
+        const auto hw = hardware(with_enable ? 8 : -1);
+        HBridgeMotor owner;
+        HBridgeMotor contender;
+        CHECK(owner.setup(hw).ok());
+        CHECK(owner.drive(600, Dir::CW).ok());
+        mock_hal::stop_result = -1;
+        CHECK(owner.stop().error == MotorOperationError::HardwareStopFailed);
+        CHECK(owner.setup(hw).error == MotorSetupError::ContainmentFailed);
+        CHECK(contender.setup(hw).error == MotorSetupError::ResourceConflict);
+        CHECK(mock_hal::pwm_routes.empty());
+        CHECK(mock_hal::pin_modes.at(hw.lpwm_pin) == OUTPUT);
+        CHECK(mock_hal::pin_modes.at(hw.rpwm_pin) == OUTPUT);
+        CHECK(mock_hal::pin_levels.at(hw.lpwm_pin) == LOW);
+        CHECK(mock_hal::pin_levels.at(hw.rpwm_pin) == LOW);
+        if (with_enable)
+            CHECK(mock_hal::pin_modes.at(hw.en_pin) == OUTPUT && mock_hal::pin_levels.at(hw.en_pin) == LOW);
+        mock_hal::stop_result = ESP_OK;
+
+        for (const int pin : {hw.lpwm_pin, hw.en_pin})
+        {
+            if (pin < 0)
+                continue;
+            mock_hal::gpio_release_failure_pin = pin;
+            CHECK(owner.setup(hw).error == MotorSetupError::ContainmentFailed);
+            CHECK(contender.setup(hw).error == MotorSetupError::ResourceConflict);
+            CHECK(mock_hal::pwm_routes.empty());
+            CHECK(mock_hal::pin_modes.at(hw.lpwm_pin) == OUTPUT);
+            CHECK(mock_hal::pin_modes.at(hw.rpwm_pin) == OUTPUT);
+            CHECK(mock_hal::pin_levels.at(hw.lpwm_pin) == LOW);
+            CHECK(mock_hal::pin_levels.at(hw.rpwm_pin) == LOW);
+            if (with_enable)
+                CHECK(mock_hal::pin_modes.at(hw.en_pin) == OUTPUT && mock_hal::pin_levels.at(hw.en_pin) == LOW);
+        }
+        mock_hal::gpio_release_failure_pin = -1;
+        CHECK(owner.setup(MotorMCPWMConfig{}).error == MotorSetupError::InvalidPwmPin);
+        checkReleasedPin(hw.lpwm_pin);
+        checkReleasedPin(hw.rpwm_pin);
+        if (with_enable)
+            checkReleasedPin(hw.en_pin);
+        CHECK(contender.setup(hw).ok());
+    }
+}
+
+void testResourceOwnershipAndMapping()
+{
+    mock_hal::reset();
+    MotorMCPWMConfig other = hardware();
+    other.lpwm_pin = 4;
+    other.rpwm_pin = 5;
+    other.en_pin = 9;
+    {
+        HBridgeMotor owner;
+        CHECK(owner.setup(hardware()).ok());
+        CHECK(owner.drive(600, Dir::CW).ok());
+        const MotorDriverStatus before = owner.status();
+        const OutputState outputs = outputState();
+        mock_hal::events.clear();
+        {
+            HBridgeMotor contender;
+            CHECK(contender.setup(other).error == MotorSetupError::ResourceConflict);
+            CHECK(mock_hal::events.empty());
+        }
+        CHECK(mock_hal::events.empty());
+        checkState(outputState(), outputs);
+        CHECK(owner.status().commanded_a_percent == before.commanded_a_percent);
+        CHECK(owner.stop().ok());
+        HBridgeMotor contender;
+        CHECK(contender.setup(other).error == MotorSetupError::ResourceConflict);
+        other.timer = MCPWM_TIMER_1;
+        CHECK(contender.setup(other).error == MotorSetupError::InvalidTimerSignals);
+        other.sig_l = MCPWM1A;
+        other.sig_r = MCPWM1B;
+        CHECK(contender.setup(other).ok());
+        CHECK(contender.drive(500, Dir::CCW).ok());
+        CHECK(owner.start().ok());
+        CHECK(owner.drive(400, Dir::CW).ok());
+        CHECK(mock_hal::running[0][0] && mock_hal::running[0][1]);
+        CHECK(contender.setup(MotorMCPWMConfig{}).error == MotorSetupError::InvalidPwmPin);
+        CHECK(mock_hal::running[0][0]);
+    }
+    checkReleasedPin(2);
+    checkReleasedPin(3);
+    checkReleasedPin(8);
+    for (int invalid = 0; invalid < 4; ++invalid)
+    {
+        HBridgeMotor motor;
+        MotorMCPWMConfig bad = hardware();
+        if (invalid == 0) bad.timer = MCPWM_TIMER_1;
+        if (invalid == 1) { bad.sig_l = MCPWM0B; bad.sig_r = MCPWM0A; }
+        if (invalid == 2) bad.unit = static_cast<mcpwm_unit_t>(2);
+        if (invalid == 3) bad.timer = static_cast<mcpwm_timer_t>(3);
+        mock_hal::events.clear();
+        CHECK(motor.setup(bad).error == MotorSetupError::InvalidTimerSignals);
+        CHECK(mock_hal::events.empty());
+    }
+    {
+        HBridgeMotor motor;
+        mock_hal::timer_create_result = -1;
+        CHECK(!motor.setup(hardware()).ok());
+        mock_hal::timer_create_result = ESP_OK;
+        HBridgeMotor replacement;
+        CHECK(replacement.setup(hardware()).ok());
+    }
+    {
+        HBridgeMotor owner;
+        CHECK(owner.setup(hardware()).ok());
+        mock_hal::stop_result = -1;
+        CHECK(owner.setup(other).error == MotorSetupError::ContainmentFailed);
+        HBridgeMotor contender;
+        CHECK(contender.setup(hardware()).error == MotorSetupError::ResourceConflict);
+        mock_hal::stop_result = ESP_OK;
+        CHECK(owner.setup(other).ok());
+        CHECK(contender.setup(hardware()).ok());
+    }
+    {
+        HBridgeMotor owner;
+        CHECK(owner.setup(hardware()).ok());
+        mock_hal::gpio_release_failure_pin = hardware().lpwm_pin;
+        CHECK(owner.setup(other).error == MotorSetupError::ContainmentFailed);
+        HBridgeMotor contender;
+        CHECK(contender.setup(hardware()).error == MotorSetupError::ResourceConflict);
+        mock_hal::gpio_release_failure_pin = -1;
+        CHECK(owner.setup(other).ok());
+        CHECK(contender.setup(hardware()).ok());
+    }
+}
+
+void testHardwareFaultUnitIsolationAndPins()
+{
+    mock_hal::reset();
+    MotorMCPWMConfig other{4, 5, 9, MCPWM_UNIT_0, MCPWM_TIMER_1, MCPWM1A, MCPWM1B};
+    {
+        HBridgeMotor owner;
+        CHECK(owner.setup(hardware(), behavior(FreewheelMode::HiZ), MotorSafetyConfig{},
+                          MotorCaptureConfig{}, hardwareFaultConfig(HardwareFaultMode::OneShot)).ok());
+        HBridgeMotor contender;
+        mock_hal::events.clear();
+        CHECK(contender.setup(other).error == MotorSetupError::ResourceConflict);
+        CHECK(mock_hal::events.empty());
+        other.unit = MCPWM_UNIT_1;
+        CHECK(contender.setup(other).ok());
+    }
+    other.unit = MCPWM_UNIT_0;
+    {
+        HBridgeMotor owner;
+        CHECK(owner.setup(hardware()).ok());
+        HBridgeMotor contender;
+        CHECK(contender.setup(other, behavior(FreewheelMode::HiZ), MotorSafetyConfig{},
+                               MotorCaptureConfig{}, hardwareFaultConfig(HardwareFaultMode::OneShot)).error ==
+              MotorSetupError::ResourceConflict);
+        MotorCaptureConfig capture{};
+        capture.cap_gpio = 2;
+        CHECK(contender.setup(other, behavior(FreewheelMode::HiZ), MotorSafetyConfig{}, capture).error ==
+              MotorSetupError::ResourceConflict);
+    }
+}
+
+void assertRecoveryBarrier(HBridgeMotor &motor)
+{
+    CHECK(motor.hasFault() && motor.status().recovery_inhibited);
+    CHECK(motor.drive(400, Dir::CW).error == MotorOperationError::FaultActive);
+    CHECK(motor.setHardBrake().error == MotorOperationError::FaultActive);
+    CHECK(motor.softBrakeNow(300).error == MotorOperationError::FaultActive);
+    CHECK(motor.start().error == MotorOperationError::FaultActive);
+    CHECK(motor.disableOutputs().ok());
+}
+
+void testRecoveryFailuresAndNewAssertions()
+{
+    for (int boundary = 0; boundary < 5; ++boundary)
+    {
+        mock_hal::reset();
+        HBridgeMotor motor;
+        CHECK(motor.setup(hardware(), behavior(FreewheelMode::HiZ), faultConfig(FaultAction::HardBrake),
+                          MotorCaptureConfig{}, hardwareFaultConfig(HardwareFaultMode::OneShot)).ok());
+        mock_hal::pin_levels[10] = HIGH;
+        mock_hal::invokeInterrupt(10);
+        CHECK(motor.pollFaults().ok());
+        CHECK(motor.clearFault().error == MotorOperationError::FaultActive);
+        mock_hal::pin_levels[10] = LOW;
+        mock_hal::invokeInterrupt(10);
+        if (boundary == 0) mock_hal::duty_result = -1;
+        if (boundary == 1) mock_hal::fault_init_result = -1;
+        if (boundary == 2) { CHECK(motor.stop().ok()); mock_hal::start_result = -1; }
+        if (boundary == 3) mock_hal::fault_deinit_result = -1;
+        if (boundary == 4) mock_hal::fault_mode_result = -1;
+        CHECK(!motor.clearFault().ok());
+        // Restore HAL availability without clearing the library barrier.
+        mock_hal::duty_result = ESP_OK;
+        mock_hal::fault_init_result = ESP_OK;
+        mock_hal::start_result = ESP_OK;
+        mock_hal::fault_deinit_result = ESP_OK;
+        mock_hal::fault_mode_result = ESP_OK;
+        assertRecoveryBarrier(motor);
+        CHECK(motor.clearFault().ok());
+        CHECK(!motor.hasFault());
+        checkState(outputState(), {LOW, 0.0f, 0.0f, false});
+        CHECK(motor.drive(400, Dir::CW).ok());
+    }
+    mock_hal::reset();
+    HBridgeMotor motor;
+    CHECK(motor.setup(hardware(), behavior(FreewheelMode::HiZ), faultConfig(FaultAction::HardBrake),
+                      MotorCaptureConfig{}).ok());
+    mock_hal::pin_levels[10] = HIGH;
+    mock_hal::invokeInterrupt(10);
+    CHECK(motor.pollFaults().ok());
+    mock_hal::pin_levels[10] = LOW;
+    mock_hal::invokeInterrupt(10);
+    mock_hal::duty_hook = []() {
+        mock_hal::pin_levels[10] = HIGH;
+        mock_hal::invokeInterrupt(10);
+        mock_hal::pin_levels[10] = LOW;
+        mock_hal::invokeInterrupt(10);
+    };
+    CHECK(motor.clearFault().error == MotorOperationError::FaultActive);
+    CHECK(motor.hasFault() && motor.status().software_fault_pending);
+    assertRecoveryBarrier(motor);
+    CHECK(motor.clearFault().ok());
+    CHECK(!motor.hasFault());
+}
+
+void testHardwareFaultArrivesDuringRecovery()
+{
+    for (int boundary = 0; boundary < 2; ++boundary)
+    {
+        mock_hal::reset();
+        HBridgeMotor motor;
+        CHECK(motor.setup(hardware(), behavior(FreewheelMode::HiZ), MotorSafetyConfig{},
+                          MotorCaptureConfig{}, hardwareFaultConfig(HardwareFaultMode::OneShot)).ok());
+        CHECK(motor.drive(400, Dir::CW).ok());
+        mock_hal::pin_levels[12] = HIGH;
+        mock_hal::invokeInterrupt(12);
+        CHECK(motor.clearFault().error == MotorOperationError::FaultActive);
+        mock_hal::pin_levels[12] = LOW;
+        mock_hal::invokeInterrupt(12);
+        const auto assertion = []() {
+            mock_hal::pin_levels[12] = HIGH;
+            mock_hal::invokeInterrupt(12);
+            mock_hal::pin_levels[12] = LOW;
+            mock_hal::invokeInterrupt(12);
+        };
+        if (boundary == 0) mock_hal::fault_mode_hook = assertion;
+        else { CHECK(motor.stop().ok()); mock_hal::start_hook = assertion; }
+        CHECK(motor.clearFault().error == MotorOperationError::FaultActive);
+        CHECK(motor.status().hardware_fault_latched);
+        assertRecoveryBarrier(motor);
+        CHECK(motor.clearFault().ok());
+        CHECK(!motor.hasFault());
+        checkState(outputState(), {LOW, 0.0f, 0.0f, false});
+    }
+}
+
+void testDeadtimeForwardingAndRange()
+{
+    for (uint32_t count : {0U, 500U, 65535U, 65536U})
+    {
+        mock_hal::reset();
+        HBridgeMotor motor;
+        MotorMCPWMConfig hw = hardware();
+        hw.use_deadtime = true;
+        hw.deadtime_red_ns = count;
+        hw.deadtime_fed_ns = count == 0 ? 123U : count;
+        const MotorSetupResult setup = motor.setup(hw);
+        if (count > 65535U)
+        {
+            CHECK(setup.error == MotorSetupError::InvalidDeadtime);
+            CHECK(mock_hal::events.empty());
+        }
+        else
+        {
+            CHECK(setup.ok());
+            CHECK(mock_hal::deadtime_red == hw.deadtime_red_ns);
+            CHECK(mock_hal::deadtime_fed == hw.deadtime_fed_ns);
+        }
+    }
+}
+
+// Last test deliberately leaves one reservation quarantined until process exit.
+void testDestructionQuarantinesFailedTeardown()
+{
+    mock_hal::reset();
+    {
+        HBridgeMotor owner;
+        CHECK(owner.setup(hardware()).ok());
+        CHECK(owner.drive(600, Dir::CW).ok());
+        mock_hal::stop_result = -1;
+    }
+    CHECK(mock_hal::pwm_routes.empty());
+    for (const int pin : {hardware().lpwm_pin, hardware().rpwm_pin, hardware().en_pin})
+    {
+        CHECK(mock_hal::pin_modes.at(pin) == OUTPUT);
+        CHECK(mock_hal::pin_levels.at(pin) == LOW);
+    }
+    mock_hal::stop_result = ESP_OK;
+    mock_hal::events.clear();
+    HBridgeMotor contender;
+    CHECK(contender.setup(hardware()).error == MotorSetupError::ResourceConflict);
+    CHECK(mock_hal::events.empty());
 }
 } // namespace
 
@@ -1627,7 +2479,7 @@ int main()
         {"one-shot disable-output fault and latch", testOneShotDisableOutputsFaultAndLatch},
         {"fault stops dither", testFaultStopsDither},
         {"coast preserves stopped MCPWM state", testCoastPreservesStoppedMcpwmState},
-        {"clear discards pending fault work", testClearDiscardsPendingFaultWork},
+        {"clear preserves pending fault notification", testClearPreservesPendingFaultNotification},
         {"level-follow supports every fault action", testLevelFollowAllFaultActions},
         {"active fault at setup supports every action", testActiveFaultAtSetupAllActions},
         {"EN-absent fault capabilities", testEnAbsentFaultCapabilities},
@@ -1653,8 +2505,28 @@ int main()
         {"hardware cycle-by-cycle status follows input", testHardwareFaultCycleByCycleStatusFollowsInput},
         {"invalid and failed hardware fault setup fails safe", testInvalidAndFailedHardwareFaultSetupFailsSafe},
         {"commissioning output API disabled by default", testCommissioningOutputApiIsDisabledByDefault},
+        {"center-aligned waveform frequency and safety", testCenterAlignedWaveformUsesRequestedFrequency},
+        {"frequency boundaries, modes and resolution failure", testFrequencyModeBoundariesAndResolutionFailure},
+        {"low-frequency reuse waits and retains ownership on timeout", testImmediateLowFrequencySetupAndReuse},
+        {"retune isolates pending and active compares", testRetuneSeparatesActiveAndPendingOutput},
+        {"retune preserves fault ownership", testRetunePreservesFaultOwnership},
+        {"counter modes and modeled electrical endpoints", testCounterModesAndElectricalEndpointsInModel},
+        {"500 kHz percentage midpoint and raw equivalence", testPercentMidpointAndRawEquivalence},
+        {"percentage range and input scales", testPercentRangeAndOtherInputScales},
+        {"exact duty endpoints across stop and restart", testExactDutyEndpointsAcrossStopAndRestart},
+        {"failed GPIO isolation retains uncertain ownership", testFailedIsolationNeverClaimsDisabledOrReleasesOwnership},
+        {"restart requires events and a fault-free enable", testRestartRequiresNewTimerEventsAndFaultFreeEnable},
         {"frequency readback tracks reconfiguration", testFrequencyReadbackTracksSuccessfulReconfiguration},
         {"pollFaults is available through interface", testPollFaultsIsAvailableThroughInterface},
+        {"EN-equipped stop, destruction and GPIO reuse", [] { testReleasedMotorPins(true); }},
+        {"EN-less stop, destruction and GPIO reuse", [] { testReleasedMotorPins(false); }},
+        {"failed motor pin teardown retains and recovers ownership", testFailedTeardownRetainsOwnedPins},
+        {"resource ownership and mapping", testResourceOwnershipAndMapping},
+        {"hardware fault unit and pin isolation", testHardwareFaultUnitIsolationAndPins},
+        {"recovery barriers and assertions", testRecoveryFailuresAndNewAssertions},
+        {"hardware assertion during recovery", testHardwareFaultArrivesDuringRecovery},
+        {"deadtime forwarding and range", testDeadtimeForwardingAndRange},
+        {"destructor quarantine", testDestructionQuarantinesFailedTeardown},
     };
 
     for (const auto &test : tests)

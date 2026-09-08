@@ -3,10 +3,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-version_h="$(sed -n 's/^#define ESP32_MCPWM_VERSION "\([^"]*\)"/\1/p' "$ROOT/src/ESP32_MCPWM.h")"
-version_props="$(sed -n 's/^version=//p' "$ROOT/library.properties")"
-version_json="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$ROOT/library.json")"
-[[ "$version_h" == "$version_props" && "$version_h" == "$version_json" ]] || fail "version metadata is inconsistent"
+python3 -B "$ROOT/test/check_release_metadata.py" "$@"
 grep -Eq '^license=MIT$' "$ROOT/library.properties" || fail "library.properties must declare MIT"
 
 for file in .clang-format .gitignore CHANGELOG.md LICENSE README.md RELEASE_CHECKLIST.md library.json library.properties platformio.ini src/ESP32_MCPWM.h test/run_host_checks.sh; do

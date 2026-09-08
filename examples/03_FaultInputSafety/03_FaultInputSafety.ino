@@ -30,7 +30,7 @@ MotorSafetyConfig safety;
 Motor motor;
 bool fault_reported = false;
 bool drive_armed = false;
-// A failed clear can release the library latch; retain our own recovery inhibit.
+// Keep application recovery intent until the library reports a successful clear.
 bool recovery_required = false;
 
 // ---- Setup ---- //
@@ -90,7 +90,7 @@ void loop()
     if (Serial.available())
     {
         const int command = Serial.read();
-        // Allow retries even when a failed clear has released the library latch.
+        // Retry failed recovery; new drive still requires a separate command.
         if (command == 'c' && recovery_required)
         {
             const MotorOperationResult clear_result = motor.clearFault();

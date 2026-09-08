@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BUILD="$ROOT/test/build"
+BUILD="${1:-$ROOT/test/build}"
 CXX="${CXX:-c++}"
 mkdir -p "$BUILD"
 "$CXX" -std=c++11 -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Wshadow -Werror \

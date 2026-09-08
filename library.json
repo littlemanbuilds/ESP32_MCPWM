@@ -1,6 +1,6 @@
 {
   "name": "ESP32_MCPWM",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Explicit Arduino-ESP32 MCPWM H-bridge control with structured operation results, software and hardware fault paths, coast/brake modes, runtime retuning, capture, and diagnostics.",
   "keywords": [
     "arduino",
@@ -27,12 +27,8 @@
     }
   ],
   "license": "MIT",
-  "frameworks": [
-    "arduino"
-  ],
-  "platforms": [
-    "espressif32"
-  ],
+  "frameworks": ["arduino"],
+  "platforms": ["espressif32"],
   "build": {
     "includeDir": "src"
   },
@@ -44,7 +40,5 @@
     "examples/05_CaptureInput/05_CaptureInput.ino",
     "examples/06_TwoMotors/06_TwoMotors.ino"
   ],
-  "headers": [
-    "ESP32_MCPWM.h"
-  ]
+  "headers": ["ESP32_MCPWM.h"]
 }

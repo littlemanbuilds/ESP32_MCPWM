@@ -54,7 +54,7 @@ A motor command is more than a duty cycle. Real H-bridge control also needs to a
 
 ESP32_MCPWM gives those concepts names and keeps them at the motor-driver boundary.
 
-It is deliberately **not** a motion planner, SafetyCore, current controller, steering controller, authority manager or vehicle state machine.
+It is deliberately **not** a motion planner, current controller, steering controller, application authority manager or system state machine.
 
 ---
 
@@ -87,7 +87,7 @@ It is deliberately **not** a motion planner, SafetyCore, current controller, ste
 
 ### No LMB-library dependencies
 
-ESP32_MCPWM does not depend on SnapshotBus, RCLink, SwitchBank, SafetyCore, SteerCore or any other LMB library. A project may wrap it with adapters, but the motor library remains independently usable.
+ESP32_MCPWM uses Arduino-ESP32 and ESP-IDF. Applications can use it directly or wrap it with their own adapters.
 
 ---
 
@@ -116,9 +116,7 @@ When the release is published to the Arduino Library Manager:
 
 Add the library to the project or reference the repository from `lib_deps`.
 
-The included `platformio.ini` is for library development and CI, not a requirement for users.
-
----
+## The included `platformio.ini` is for library development and CI, not a requirement for users.
 
 ## Supported targets
 
@@ -129,11 +127,11 @@ The primary project and example target is:
 - ESP32-S3 DevKitC-1.
 
 The routine CI matrix covers ESP32-S3 DevKitC-1. Original ESP32 Dev Module
-compilation was also recorded for v2.0.0; it is not a separate routine CI gate.
+compilation was also recorded for v2.1.0; it is not a separate routine CI gate.
 
 ESP32-S2 and ESP32-C3 are **not** listed as supported targets for this release because the pinned legacy MCPWM API is not available for those targets in this release configuration.
 
-The authoritative v2.0.0 release baseline is:
+The authoritative v2.1.0 release baseline is:
 
 - PlatformIO Core 6.1.19;
 - pioarduino Espressif32 55.03.38;
@@ -145,7 +143,7 @@ A successful compile does not prove that every peripheral signal can be routed t
 
 ### ESP-IDF driver generation
 
-v2.0.0 uses the legacy `driver/mcpwm.h` API currently provided by Arduino-ESP32 3.x / ESP-IDF 5.x. ESP-IDF 6 removes that legacy driver in favor of the newer MCPWM prelude/object API.
+v2.1.0 uses the legacy `driver/mcpwm.h` API currently provided by Arduino-ESP32 3.x / ESP-IDF 5.x. ESP-IDF 6 removes that legacy driver in favor of the newer MCPWM prelude/object API.
 
 That future backend migration should be handled as a dedicated library release rather than mixing two driver architectures into this release. The public motor concepts introduced in v2 are intentionally suitable for either backend.
 
@@ -295,13 +293,60 @@ hardware.pwm_freq_hz = 20000;
 hardware.input_max = 1023;
 ```
 
+`pwm_freq_hz` specifies the intended GPIO waveform frequency. The pinned
+ESP32 and ESP32-S3 configurations use a 1 MHz timer for edge-aligned up or
+down counting and a 2 MHz timer for center-aligned up/down counting. Setup
+and runtime accept 16–500,000 Hz in all three drive modes. Freeze mode is
+rejected. The upper limit preserves a usable timer period. The driver chooses
+the closest frequency representable through the legacy timer API. Duty and
+frequency quantization become coarse near the upper limit. Other users of
+the MCPWM group must preserve its default clock and leave owned timer events,
+output routing and resources under this driver's control.
+
+Setup and teardown hold both PWM pins low at the GPIO matrix while changing
+timer state, even without an EN pin. Timer reuse waits for a fresh hardware
+stop event. After restart, the driver observes peak and zero events before
+routing the PWM pins back to MCPWM. These waits can span timer cycles and
+run in the calling task. A failed or timed-out stop prevents resource reuse.
+Retry `stop()` or `setup()` after a recoverable failure. A failed destructor
+teardown quarantines the occupied resources until reboot. Explicit stop and
+teardown on an EN-less bridge switch the two GPIO routes separately, so validate
+how the bridge responds to the intermediate input state.
+
+A successful `stop()` keeps ownership and drives PWM A, PWM B and configured EN
+low. Successful resource release, including destruction or teardown before
+re-setup, switches both PWM pads to inputs with weak internal pull-downs and
+releases EN the same way after the PWM pads. The library then relinquishes its
+reservation. Internal pulls provide only weak bias and cannot guarantee a low
+voltage against external circuitry or throughout reset and power sequencing.
+For safety-relevant installations, use appropriate external pull-downs and
+default-disable circuitry that keeps the bridge inactive independently of MCU
+pin state.
+
 Optional MCPWM dead-time configuration remains available through the same structure.
 Despite their historical `_ns` names, `deadtime_red_ns` and `deadtime_fed_ns`
 are passed unchanged to the legacy MCPWM API as RED/FED counts. They are not
 converted from nanoseconds; the actual delay depends on the MCPWM group
-resolution. Validate the resulting waveform before enabling dead time.
+resolution. Values must be in 0..65535; larger counts are rejected before routing
+to avoid register truncation. A future nanosecond conversion API is a separate
+compatibility decision. Validate the resulting waveform before enabling dead time.
 
-Setup rejects invalid or conflicting pins, duplicate PWM signals, invalid input ranges and invalid drive frequencies before activating the bridge.
+Setup rejects invalid unit/timer bounds, mismatched or swapped A/B signal pairs,
+conflicting pins, invalid ranges and frequencies before routing a fresh configuration.
+Timer 0 requires MCPWM0A/MCPWM0B, timer 1 requires MCPWM1A/MCPWM1B, and timer 2
+requires MCPWM2A/MCPWM2B on supported hardware.
+
+Each configured instance reserves its timer/operator and adapter-used GPIOs.
+Ordinary instances can use separate timers in a unit. Hardware-fault configuration
+reserves the entire unit: the legacy SDK deinitialization clears one-shot state on
+all its operators. Capture uses a GPIO interrupt, not an MCPWM capture channel.
+Reservations are atomic across instances; they do not coordinate arbitrary ESP-IDF
+callers. Stop retains ownership because the instance can restart. Re-setup first
+tears down the old configuration, then validates and reserves the replacement;
+it is not transactional. Safe teardown disconnects old PWM routes and releases
+ownership. Setup/teardown failure retains reservations until cleanup succeeds;
+failed destruction quarantines those resources until reboot without retaining an
+object pointer. ContainmentFailed reports incomplete cleanup while the object lives.
 
 ### `MotorBehaviorConfig`
 
@@ -370,7 +415,7 @@ sequence
 
 `sequence` is a monotonic successful-operation counter. A rejected operation does not pretend that the hardware changed.
 
-`changed` is literal: it is `true` only when a successful request changes the public semantic/output state. Reapplying an already-current drive, coast, disable, brake, freewheel selection or lifecycle state returns success with `changed == false`, even if the driver deliberately reasserts hardware for safety.
+`changed` reports an observable driver or output change. A failed operation can change state when containment or a partial update succeeds. The operation sequence advances on successful changes. Reapplying an already-current drive, coast, disable, brake, freewheel selection or lifecycle state returns success with `changed == false`, even if the driver deliberately reasserts hardware for safety.
 
 Representative errors include:
 
@@ -487,7 +532,7 @@ Available software actions are:
 - `DisableOutputs`;
 - `HardBrake` — explicit opt-in only.
 
-In one-shot mode, the software observer latches the fault. `clearFault()` rejects an active physical input. Once the input is inactive, it clears the software latch before performing fallible output writes and recovery operations. A failed recovery can therefore leave `hasFault()` false and allow a later drive command. Keep an application-owned drive inhibit until the returned recovery result reports success; `hasFault() == false` alone does not confirm recovery. For level-follow mode, release returns the driver to a quiet zero-output state; it never restores the previous drive command.
+In one-shot mode, the software observer latches the fault. `clearFault()` rejects active inputs and keeps `hasFault()` true through quiet-output staging, peripheral re-arm and timer restart. Any failure retains the recovery inhibit and blocks drive, brake, start and commissioning requests; stop/disable remain available. Only successful recovery with no newer fault event releases the barrier. Success leaves zero demand and EN low, and never restores an old drive or dither command. Keep the application's recovery result checks and require a separate new drive command. Level-follow software release stays inhibited until `pollFaults()` completes the same quiet recovery; failed polling can be retried with `clearFault()`. Pending assertions are notified before recovery; assertions arriving during recovery remain pending and supersede that attempt.
 
 ### 2. MCPWM peripheral fault — `MotorHardwareFaultConfig`
 
@@ -570,6 +615,7 @@ Includes:
 - EN capability and commanded state;
 - software fault configured/active/pending;
 - hardware fault configured/active/latched;
+- unresolved recovery inhibit (also included in `hasFault()`);
 - dither activity;
 - named `MotorOutputMode`;
 - commanded A/B duty;
@@ -585,17 +631,19 @@ ISR-shared fields are protected by the ESP32 critical-section mechanism rather t
 const MotorHardwareReadback readback = motor.readback();
 ```
 
-Where the legacy driver exposes the information, this reads:
+Frequency is a whole-Hz estimate from the programmed period and the driver
+clock setting. A zero value means the timer is stopped, transitioning,
+inhibited, or the legacy SDK's reported quotient disagrees. The SDK does not
+read the active divider directly. Duty values are derived from comparator
+registers and may reflect shadow values before a PWM boundary. They describe
+the generator setting before dead time, hardware fault actions and GPIO routing.
+Measure the GPIO waveform when a tolerance matters.
 
-- MCPWM frequency;
-- A duty;
-- B duty;
-- physical EN GPIO level;
-- hardware-fault GPIO level.
-
-`running_cached` remains explicitly named **cached** because the legacy API does not expose an equivalent direct hardware getter for timer running state.
-
-The distinction matters: readback reports what can genuinely be read back, and does not manufacture a hardware confirmation that the SDK cannot provide.
+`running_cached` and `status().mcpwm_running` remain conservative lifecycle
+indicators. The driver leaves them true during a pending stop or stop timeout.
+Use the operation result and recovery inhibit to distinguish an unconfirmed
+stop from completed containment. EN readback and the hardware-fault GPIO
+level are read when those inputs are available.
 
 ---
 
@@ -605,17 +653,31 @@ The distinction matters: readback reports what can genuinely be read back, and d
 const MotorOperationResult result = motor.reconfigureFrequency(25000);
 ```
 
-The operation:
+For a supported change, the driver stops dither, lowers EN before remapping
+either PWM GPIO, drives both PWM GPIOs low and waits for hardware stop. Then it writes the
+period, stages zero compare values and restarts only if the timer was running
+before the call. A running timer reconnects to the PWM pins after fresh peak
+and zero events. Drive stays off until the next command. Previously active
+dither may resume after the transition. A stopped timer stays stopped.
 
-1. validates the requested frequency;
-2. moves the bridge to a quiet output where possible;
-3. asks MCPWM to change frequency;
-4. records the new value only after success;
-5. restores an active dither state when appropriate.
+Active faults reject the request with `FaultActive`. A running timer without
+EN rejects a change with `Unsupported` because the two PWM pins are remapped
+separately. Stop it before retuning. Peripheral fault actions and dead time
+also reject changes because those features own output behavior while GPIOs
+would otherwise be isolated. Select the frequency at setup for those configurations.
+An unchanged valid request leaves the hardware alone when no fault is active.
 
-A failed frequency change is reported and does not silently update the driver's configured frequency.
+`status().pwm_frequency_hz` records the last request successfully programmed
+into the timer. An SDK frequency-write failure retains the previous request
+and leaves the outputs disabled. A subsequent compare, restart, or dither
+failure can return an error after the new request was programmed. Check both
+the operation result and status, and recover before commanding drive.
 
-Use `readback()` if the application wants the frequency reported by the MCPWM API.
+When upgrading from v2.0.0 to v2.1.0, or from a development snapshot with
+the earlier frequency behavior, remove any doubled center-aligned frequency
+compensation. Check the 16–500,000 Hz limits, freeze-mode rejection,
+and runtime restrictions above. Verify the waveform and electrical duty at the
+chosen operating points before returning the motor to service.
 
 ---
 
@@ -659,7 +721,7 @@ The host test suite mirrors that behavior with a mutex-backed test implementatio
 
 This does not prove real-world interrupt latency; it verifies the C++ shared-state behavior.
 
-Internal synchronization protects ISR/task status and prevents stale deferred dither work from committing after a newer completed command. It does **not** make one motor instance a safe multi-writer actuator. Use one application command owner/arbitrator per motor instance; command authority and SafetyCore policy remain application-owned.
+Internal synchronization protects ISR/task status and prevents stale deferred dither work from committing after a newer completed command. It does **not** make one motor instance a safe multi-writer actuator. Use one application command owner/arbitrator per motor instance; command authority, rearming and system safety policy remain application-owned.
 
 ---
 
@@ -684,10 +746,11 @@ unless the library is compiled with:
 ```
 
 The compile-time gate exists because raw output forcing bypasses the normal drive/coast/brake model.
-Enabled calls still require setup and no active fault, but do not start a
-stopped MCPWM timer or update `status().output_mode`. Inspect commanded duty,
-readback and running state separately; the previous normal mode label does
-not describe a raw commissioning request.
+Enabled calls require setup, a running timer and no fault or recovery inhibit.
+Rejected calls do not restart MCPWM or assert EN. Success reports
+`MotorOutputMode::Commissioning`, raw commanded duties and EN intent; identical
+requests return `changed == false`. Write failure reports `Uncertain`; normal
+stop and drive commands return to their usual modes.
 
 Use it only for controlled bench commissioning where directly forcing the two bridge inputs is deliberate and understood.
 
@@ -724,8 +787,8 @@ Measures edge intervals with an ESP32-S3 test signal/jumper.
 ### 06_TwoMotors
 
 Uses independent MCPWM timers/channels to control two H-bridges. The application
-must assign distinct timers and matching A/B signal pairs; setup does not check
-cross-instance resource conflicts or timer/signal coherence.
+assigns distinct timers and matching A/B signal pairs; setup checks those mappings
+and rejects overlapping resources before altering another instance.
 
 The examples remain intentionally small. The README is the technical reference; the examples are there to get working code on a bench quickly.
 
@@ -840,13 +903,13 @@ Before calling a vehicle/machine integration validated, measure the real system.
 
 With the actual module, confirm what the motor terminals do for:
 
-| EN | A | B | Expected library name | Must be measured |
-|---:|---:|---:|---|---|
-| 0 | 0 | 0 | disabled / Hi-Z intent | terminal voltage/current |
-| 1 | 0 | 0 | awake zero / coast intent | actual coast/brake state |
-| 1 | PWM | 0 | CW drive | polarity/current |
-| 1 | 0 | PWM | CCW drive | polarity/current |
-| 1 | 1 | 1 | hard-brake electrical action | current/regeneration |
+|  EN |   A |   B | Expected library name        | Must be measured         |
+| --: | --: | --: | ---------------------------- | ------------------------ |
+|   0 |   0 |   0 | disabled / Hi-Z intent       | terminal voltage/current |
+|   1 |   0 |   0 | awake zero / coast intent    | actual coast/brake state |
+|   1 | PWM |   0 | CW drive                     | polarity/current         |
+|   1 |   0 | PWM | CCW drive                    | polarity/current         |
+|   1 |   1 |   1 | hard-brake electrical action | current/regeneration     |
 
 Do not assume the labels above are mechanically true until the actual board is measured.
 
@@ -1018,7 +1081,7 @@ to improve startup and fault diagnostics and avoid setting local lifecycle flags
 
 - ESP32-specific; this is not a portable generic Arduino PWM library.
 - Verified target compiles are limited to ESP32-S3 and original ESP32 for this release.
-- v2.0.0 uses the legacy ESP-IDF MCPWM driver exposed by current Arduino-ESP32 3.x. A future ESP-IDF 6 backend requires dedicated migration work.
+- v2.1.0 uses the legacy ESP-IDF MCPWM driver exposed by current Arduino-ESP32 3.x. A future ESP-IDF 6 backend requires dedicated migration work.
 - Software fault actions require `pollFaults()` and are scheduler-dependent.
 - MCPWM hardware fault actions control generator outputs; they do not guarantee external bridge power removal.
 - The legacy hardware fault path in this release is restricted to active-high triggering.
@@ -1068,7 +1131,7 @@ ESP32_MCPWM/
 Current version:
 
 ```text
-2.0.0
+2.1.0
 ```
 
 See [CHANGELOG.md](CHANGELOG.md) for detailed release history.

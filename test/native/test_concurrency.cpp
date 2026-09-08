@@ -28,6 +28,29 @@ int main()
 {
     mock_hal::reset();
 
+    // Only the winner reaches HAL; join before touching mock state or destroying
+    // either object. This stresses the real registry without mock data races.
+    for (int attempt = 0; attempt < 100; ++attempt)
+    {
+        HBridgeMotor first;
+        HBridgeMotor second;
+        std::atomic<int> ready{0};
+        bool first_ok = false;
+        bool second_ok = false;
+        const auto claim = [&](HBridgeMotor &driver, bool &ok) {
+            ready.fetch_add(1);
+            while (ready.load() != 2) std::this_thread::yield();
+            ok = driver.setup(hardware()).ok();
+        };
+        std::thread a(claim, std::ref(first), std::ref(first_ok));
+        std::thread b(claim, std::ref(second), std::ref(second_ok));
+        a.join();
+        b.join();
+        if (first_ok == second_ok) return 3;
+        HBridgeMotor &owner = first_ok ? first : second;
+        if (!owner.drive(500, Dir::CW).ok() || !mock_hal::running[0][0]) return 4;
+    }
+
     MotorSafetyConfig safety{};
     safety.fault_gpio = 10;
     safety.oneshot = false;

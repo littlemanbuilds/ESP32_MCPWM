@@ -40,7 +40,7 @@ class HBridgeMotor : public IMotorDriver
     /// @brief Construct an unconfigured motor driver.
     HBridgeMotor() = default;
 
-    /// @brief Stop timers, detach interrupts, and make a best-effort output shutdown.
+    /// @brief Stop outputs and detach callbacks; failed teardown quarantines resources until reboot.
     ~HBridgeMotor() noexcept override;
 
     // ---- Setup ---- //
@@ -90,6 +90,12 @@ class HBridgeMotor : public IMotorDriver
      *
      * Existing resources are contained before new configuration is validated;
      * teardown failure therefore takes precedence over a later validation error.
+     * Valid configurations atomically reserve timer/operator and adapter-used pins;
+     * hardware faults require the entire unit because legacy fault deinit clears
+     * every operator. Stop retains ownership. Successful teardown disconnects PWM
+     * routes before reuse; failed cleanup retains ownership for retry, and failed
+     * destruction quarantines it until reboot. External ESP-IDF users must coordinate
+     * separately. A rejected fresh contender never mutates another owner's hardware.
      *
      * @param hw MCPWM pin, timer, signal and range configuration.
      * @param beh Freewheel, dither and soft-brake behavior.
@@ -125,7 +131,10 @@ class HBridgeMotor : public IMotorDriver
     /**
      * @brief Apply a positive percentage drive request.
      *
-     * @param percent Positive request in (0,100].
+     * Round to the nearest logical count, with ties rounded up. A positive
+     * request maps to at least one count before timer quantization.
+     *
+     * @param percent Finite positive request, saturated at 100%.
      * @param dir Desired direction.
      * @return Structured operation result.
      */
@@ -200,16 +209,17 @@ class HBridgeMotor : public IMotorDriver
     /// @return Deferred handling result; unchanged success when HBridgeMotor has no pending work.
     MotorOperationResult pollFaults() noexcept override;
 
-    /// @brief Return whether software or MCPWM fault state is active or latched.
+    /// @brief Return whether a fault or unresolved recovery inhibits energizing commands.
     ///
-    /// @return True when a software or hardware fault is active or latched; false otherwise.
+    /// @return True for active/latched faults or pending/failed recovery; false after successful recovery.
     ESP32_MCPWM_NODISCARD bool hasFault() const noexcept override;
 
     /// @brief Clear inactive fault state and recover to quiet outputs.
     ///
-    /// The software latch is cleared before fallible output writes and peripheral recovery.
-    /// If recovery fails, hasFault() may be false and later drive commands may be accepted.
-    /// Keep an application-owned drive inhibit until a clearFault() result reports success.
+    /// Latches and the admission barrier are released only after quiet output, re-arm
+    /// and restart succeed without a newer fault event. Failures keep hasFault() true.
+    /// Success leaves EN low and zero demand; issue a separate command to drive.
+    /// Pending software assertions are notified before recovery, never discarded.
     ///
     /// @return Recovery result; active inputs or failed containment/re-arm prevent successful recovery.
     MotorOperationResult clearFault() noexcept override;
@@ -246,17 +256,19 @@ class HBridgeMotor : public IMotorDriver
     /// @return Lifecycle result; success establishes configured coast/dither, never restores prior drive.
     MotorOperationResult start() noexcept override;
 
-    /// @brief Stop MCPWM generation and deassert outputs where possible.
+    /// @brief Drive both PWM pins low and confirm MCPWM stop.
     ///
     /// @return Lifecycle result; success means zero duty was written and MCPWM was stopped.
     MotorOperationResult stop() noexcept override;
 
     /**
-     * @brief Change drive PWM frequency after moving outputs quiet where possible.
+     * @brief Change drive frequency with both PWM pins held low during the update.
      *
-     * A successful non-dither change leaves outputs in a zero-duty coast state;
-     * the caller must issue a new drive request. Active dither is restarted only
-     * after the frequency update succeeds.
+     * Previously running PWM returns to coast or resumes active dither.
+     * A stopped timer stays stopped. Running changes require EN. Active faults,
+     * peripheral fault actions, and dead time prevent changes. A restart
+     * error can follow a successful frequency write, so inspect status as
+     * well as the operation result.
      *
      * @param new_hz Requested drive PWM frequency in Hz.
      * @return Structured result; an already-current frequency is unchanged success.
@@ -292,21 +304,18 @@ class HBridgeMotor : public IMotorDriver
      *
      * The method is inert unless ESP32_MCPWM_ENABLE_COMMISSIONING_API is set to 1
      * before compiling the library.
-     * Enabled calls require setup and no fault, but do not start MCPWM or
-     * update the normal output_mode label. Inspect duties and running state
-     * separately during commissioning.
+     * Enabled calls require setup, a running timer and no fault/recovery inhibit.
+     * Success reports Commissioning mode, commanded duties and EN intent. Repeated
+     * identical requests report changed=false; write failure reports Uncertain.
      *
      * @param a_high True requests full A duty; false requests zero A duty.
      * @param b_high True requests full B duty; false requests zero B duty.
-     * @return CommissioningDisabled by default; enabled builds return setup, fault or output-write failures.
+     * @return CommissioningDisabled by default; enabled builds return setup, stopped-state, fault or output-write failures.
      */
     MotorOperationResult forceOutputs(bool a_high, bool b_high) noexcept override;
 
   private:
     static constexpr uint32_t kMicrosPerSec = 1000000U; ///< Hz-to-µs conversion.
-    static constexpr float kDutyEps = 0.01f;            ///< Duty cache epsilon.
-    static constexpr int kPwmHzMin = 1;                 ///< Lowest accepted drive PWM frequency.
-    static constexpr int kPwmHzMax = 1000000;           ///< Highest accepted drive PWM frequency.
     static constexpr int kSoftHzMax = 10000;            ///< Highest practical dither frequency.
 
     enum class BrakePhase : uint8_t
@@ -568,7 +577,43 @@ class HBridgeMotor : public IMotorDriver
     /// @brief Detach the capture GPIO interrupt when configured.
     void detachCaptureInterrupt() noexcept;
 
+    /// @brief Atomically reserve the timer and adapter-used pins before any routing.
+    ///
+    /// @param hw Validated peripheral and pin configuration.
+    /// @param safety Software fault observer pins.
+    /// @param cap GPIO capture configuration.
+    /// @param fault Hardware fault configuration requiring exclusive unit use.
+    /// @return False on conflict, with no peripheral effects.
+    bool acquireResources(const MotorMCPWMConfig &hw, const MotorSafetyConfig &safety,
+                          const MotorCaptureConfig &cap, const MotorHardwareFaultConfig &fault) noexcept;
+
+    /// @brief Release contained motor pins as inputs with a weak pull-down.
+    ///
+    /// @return False on pin cleanup failure, with the reservation retained for retry.
+    bool releaseResources() noexcept;
+
     // ---- Setup / teardown ---- //
+
+    /// @brief Drive both owned PWM pins low using GPIO instead of the peripheral.
+    ///
+    /// @return True when both pins were isolated successfully.
+    bool isolatePwm() noexcept;
+
+    /// @brief Request stop at zero and wait for the owned timer's stop event.
+    ///
+    /// @return True when stopped, or false with the reservation retained for recovery.
+    bool stopTimer() noexcept;
+
+    /// @brief Start the timer and reconnect isolated pins after fresh peak and zero boundaries.
+    ///
+    /// @param abort_on_fault Keep isolated output routes on a newly observed fault in an ordinary start.
+    /// @return None on success, or a restart or fault diagnosis.
+    MotorOperationError startTimer(bool abort_on_fault = false) noexcept;
+
+    /// @brief Inhibit both PWM outputs and confirm hardware stop.
+    ///
+    /// @return None on success, or the output or timer failure requiring recovery.
+    MotorOperationError quiesceTimer() noexcept;
 
     /// @brief Tear down previous resources and contain outputs before a setup attempt.
     ///
@@ -644,9 +689,15 @@ class HBridgeMotor : public IMotorDriver
     MotorHardwareFaultConfig hardware_fault_{};           ///< Accepted peripheral fault configuration snapshot.
 
     bool setup_done_{false};              ///< True only after all setup and initial containment succeeds.
+    bool resources_owned_{false};         ///< Reservation retained until successful teardown.
+    bool recovery_inhibited_{false};      ///< Failed or in-progress recovery blocks energizing commands.
     bool mcpwm_initialized_{false};       ///< True while MCPWM resources require teardown.
-    bool mcpwm_running_{false};           ///< Cached lifecycle state after successful start/stop calls.
+    bool mcpwm_running_{false};           ///< May be running until a hardware stop event is confirmed.
+    bool timer_stop_pending_{false};      ///< Stop requested, hardware event still outstanding.
+    bool timer_recovery_required_{false}; ///< Partial containment blocks commands until stop or setup is retried.
+    bool pwm_isolated_{false};            ///< Both PWM pins routed to low GPIO latches.
     bool deadtime_enabled_{false};        ///< True while dead-time requires explicit teardown.
+    bool hardware_fault_mode_configured_{false}; ///< Brake action tables require neutralization on teardown.
     bool hardware_fault_enabled_{false};  ///< True while the MCPWM peripheral fault path is configured.
     bool hardware_fault_active_{false};   ///< Synchronized current peripheral fault GPIO level.
     bool hardware_fault_latched_{false};  ///< One-shot fault observed and awaiting safe re-arm.

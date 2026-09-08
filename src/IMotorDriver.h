@@ -41,9 +41,9 @@
 /**
  * @brief Hardware configuration for an MCPWM-driven H-bridge motor.
  *
- * The application must choose the A/B signal pair matching the timer and keep
- * its MCPWM resources exclusive. HBridgeMotor does not validate timer/signal
- * coherence or reserve resources against other instances or peripheral users.
+ * HBridgeMotor validates the timer/A/B mapping and reserves resources against
+ * other HBridgeMotor instances. Direct ESP-IDF users must coordinate separately.
+ * Hardware faults require exclusive unit use because legacy deinit clears all operators.
  */
 struct MotorMCPWMConfig
 {
@@ -56,14 +56,14 @@ struct MotorMCPWMConfig
     mcpwm_io_signals_t sig_l = MCPWM0A;  ///< MCPWM signal for LPWM.
     mcpwm_io_signals_t sig_r = MCPWM0B;  ///< MCPWM signal for RPWM.
 
-    int pwm_freq_hz = 20000;                         ///< Drive PWM frequency in Hz.
+    int pwm_freq_hz = 20000;                         ///< Requested drive waveform frequency in Hz.
     int input_max = 1023;                            ///< Maximum logical drive input.
     mcpwm_counter_type_t counter = MCPWM_UP_COUNTER; ///< MCPWM counter mode.
 
     bool use_deadtime = false;                                               ///< Enable MCPWM dead-time insertion.
     mcpwm_deadtime_type_t deadtime_type = MCPWM_ACTIVE_HIGH_COMPLIMENT_MODE; ///< Dead-time mode.
-    uint32_t deadtime_red_ns = 500;                                          ///< Legacy RED count passed unchanged; suffix retained for compatibility.
-    uint32_t deadtime_fed_ns = 500;                                          ///< Legacy FED count passed unchanged; suffix retained for compatibility.
+    uint32_t deadtime_red_ns = 500;                                          ///< Legacy RED count 0..65535 passed unchanged; suffix retained for compatibility.
+    uint32_t deadtime_fed_ns = 500;                                          ///< Legacy FED count 0..65535 passed unchanged; suffix retained for compatibility.
 
     /// @brief Construct an unassigned hardware configuration.
     MotorMCPWMConfig() = default;
@@ -126,14 +126,17 @@ enum class MotorSetupError : uint8_t
     InvalidPwmPin,                 ///< LPWM or RPWM is not a usable output pin.
     DuplicatePwmPin,               ///< LPWM and RPWM use the same pin.
     PinConflict,                   ///< Optional pins conflict with another configured pin.
-    InvalidPwmFrequency,           ///< Drive PWM frequency is outside the supported range.
+    InvalidPwmFrequency,           ///< Drive PWM frequency or counter mode is unsupported.
     InvalidInputRange,             ///< Logical PWM input range is invalid.
     InvalidDitherConfig,           ///< Dither timing cannot form a valid period.
     InvalidHardwareFaultConfig,    ///< Hardware fault configuration is inconsistent.
     UnsupportedHardwareFaultLevel, ///< Legacy MCPWM hardware fault path requires active-high input.
     HardwareInitFailed,            ///< MCPWM setup failed.
     HardwareFaultInitFailed,       ///< MCPWM peripheral fault setup failed.
-    TimerInitFailed                ///< Soft-brake timer creation failed.
+    TimerInitFailed,               ///< Soft-brake timer creation failed.
+    InvalidTimerSignals,           ///< Unit/timer bounds or A/B signal routing is invalid.
+    ResourceConflict,              ///< Another instance owns overlapping peripheral resources or pins.
+    InvalidDeadtime                ///< Legacy RED/FED count exceeds the 16-bit register range.
 };
 
 /**
@@ -201,13 +204,13 @@ enum class MotorOperation : uint8_t
 enum class MotorOperationError : uint8_t
 {
     None,                     ///< Operation completed successfully.
-    Unsupported,              ///< Optional operation is not implemented by this driver.
+    Unsupported,              ///< Optional operation is unsupported by this driver or configuration.
     NotSetup,                 ///< Driver setup has not completed.
     FaultActive,              ///< A software or hardware fault currently inhibits the request.
     InvalidCommand,           ///< Request is malformed or invalid for the current state.
     HardwareWriteFailed,      ///< MCPWM duty output write failed.
     HardwareStartFailed,      ///< MCPWM start failed.
-    HardwareStopFailed,       ///< MCPWM stop failed.
+    HardwareStopFailed,       ///< MCPWM stop was rejected or did not complete within its bound.
     TimerFailed,              ///< Soft-brake timer operation failed.
     FrequencyChangeFailed,    ///< MCPWM frequency update failed.
     HardwareFaultClearFailed, ///< Hardware one-shot fault could not be re-armed.
@@ -441,7 +444,8 @@ enum class MotorOutputMode : uint8_t
     DitherBrake,      ///< Explicit soft/dither braking active.
     HardBrake,        ///< Explicit full electronic brake.
     FaultContainment, ///< Software fault containment action is active.
-    Uncertain         ///< A hardware failure prevents a truthful output-state claim.
+    Uncertain,        ///< A hardware failure prevents a truthful output-state claim.
+    Commissioning     ///< Raw A/B commissioning command; inspect commanded duties and EN.
 };
 
 /**
@@ -470,6 +474,7 @@ struct MotorDriverStatus
     uint32_t capture_sequence = 0;                               ///< Successful capture measurement sequence.
     MotorOperation last_operation = MotorOperation::None;        ///< Most recent operation request.
     MotorOperationError last_error = MotorOperationError::None;  ///< Most recent operation result.
+    bool recovery_inhibited = false;                            ///< Quiet recovery is pending, in progress or failed.
 };
 
 /**
@@ -478,12 +483,12 @@ struct MotorDriverStatus
 struct MotorHardwareReadback
 {
     bool valid = false;                       ///< Driver is configured sufficiently for readback.
-    uint32_t frequency_hz = 0;                ///< MCPWM timer frequency returned by the driver.
-    float duty_a_percent = 0.0f;              ///< MCPWM A duty returned by the driver.
-    float duty_b_percent = 0.0f;              ///< MCPWM B duty returned by the driver.
+    uint32_t frequency_hz = 0;                ///< Estimated waveform Hz from timer configuration; zero if unavailable.
+    float duty_a_percent = 0.0f;              ///< Generator A duty derived from the compare setting.
+    float duty_b_percent = 0.0f;              ///< Generator B duty derived from the compare setting.
     bool enable_control = false;              ///< EN GPIO exists.
     bool enable_asserted = false;             ///< Physical EN GPIO level when available.
-    bool running_cached = false;              ///< Cached lifecycle state; no legacy hardware getter exists.
+    bool running_cached = false;              ///< Cached lifecycle state; the timer may be running until stop is confirmed.
     bool hardware_fault_configured = false;   ///< Peripheral fault path is configured.
     bool hardware_fault_input_active = false; ///< Current hardware-fault GPIO level.
 };
@@ -732,7 +737,7 @@ class IMotorDriver
         return 0;
     }
 
-    /// @brief Return whether any driver fault state is active or latched.
+    /// @brief Return whether a fault or unresolved recovery inhibits energizing commands.
     ///
     /// @return False in the base implementation; concrete drivers report active or latched faults.
     ESP32_MCPWM_NODISCARD virtual bool hasFault() const noexcept
