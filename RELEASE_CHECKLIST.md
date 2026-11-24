@@ -1,16 +1,33 @@
 # ESP32_MCPWM release checklist
 
-Target release **2.1.1**. Proposed publication **2026-11-24**. Synchronize the changelog and release metadata with the intended publication date before final commit qualification.
+Target release **2.1.2**. Proposed publication **2026-11-24**. Confirm the date before final commit qualification and requalify the metadata if the publication date changes.
 
-Publication is on hold pending final-commit CI and the open release gates below. Checked source, API, example and documentation items record earlier review of the relevant source and examples. They carry no hardware or publication claim.
+Publication requires final-commit CI, artifact-bound owner authorization and independent verification of the public distributions. Checked source, API, example and documentation items record earlier review of the relevant source and examples.
 
 ## Release preparation
 
-- [x] Version string, numeric macros and both package manifests agree on 2.1.1.
-- [x] README current version and migration direction agree with the target release.
-- [x] One dated v2.1.1 changelog entry covers the correction and `[Unreleased]` is empty. The v2.1.0 and earlier entries are preserved.
+- [ ] Verify version string, numeric macros and both package manifests agree on 2.1.2.
+- [ ] Verify README current version and migration direction.
+- [ ] Verify one dated v2.1.2 changelog entry and an empty `[Unreleased]` section. Preserve v2.1.1 and earlier entries.
 - [ ] Confirm the actual publication date, proposed tag and final release notes against both manifests before tagging.
-- [ ] Confirm the final public diff, source ZIP and registry package against the exact release commit.
+- [ ] Confirm equivalence to v2.1.1 for the implementation, public headers apart from the two version macros, examples, build configuration, dependency pins and functional regressions.
+- [ ] Verify the complete Git index and final tree against the public source inventory.
+
+## Distribution
+
+Use the artifact-bound LMB Harness v4.1.0 release procedure. The destinations
+are GitHub release `littlemanbuilds/ESP32_MCPWM` at `v2.1.2`, PlatformIO
+Registry library `littlemanbuilds/ESP32_MCPWM` at `2.1.2`, and Arduino
+Library Manager library `ESP32_MCPWM` at `2.1.2` via GitHub tag indexing.
+The release uses GitHub's generated source archives.
+
+- [ ] Build and verify the exact commit's GitHub ZIP and tarball, PlatformIO Core 6.1.19 archive, and Arduino reference ZIP against the positive inventories.
+- [ ] Normalize the PlatformIO archive through the Harness and record each approved archive's size, SHA-256, packager and file hashes.
+- [ ] Record exact final-commit CI and independent readiness acceptance against the approved artifacts and destination identities.
+- [ ] Obtain the owner's exact artifact-bound authorization before public tagging, release creation or upload.
+- [ ] Verify the public GitHub tag and release, generated source ZIP and tarball, and PlatformIO Registry version metadata and actual download against the approved files and content.
+- [ ] Verify the indexed Arduino Library Manager download when available. Keep final acceptance open while indexing is pending.
+- [ ] Obtain independent acceptance of the actual public downloads. Stop on a distribution mismatch and apply the Harness incident procedure.
 
 ## Source and API
 
@@ -66,7 +83,7 @@ and the pinned current SDK smoke sketch and six examples.
 
 Earlier logic-only observations include center-aligned 20 kHz steady PWM, immediate 16 Hz timer reuse, EN-less running-retune rejection, software and peripheral fault transitions, and GPIO teardown. Separate destruction-marker captures showed EN and each PWM pin low in the observed windows. The 500 kHz percentage midpoint passed in up- and down-count modes with operator-reported 2.000 µs period and 1.000 µs HIGH on PWM B. These observations cover the captured windows and setup only, including no measurement of pull-down strength or simultaneous three-pin release.
 
-Release hardware items below remain open. A completed item requires evidence for the full stated scope. No deferral has been approved.
+For the v2.1.2 packaging correction, independently verify the applicability of the v2.1.1 observations against source equivalence. The broader qualification items below remain open for their original scope.
 
 - [x] `hw-shutdown-20khz` — isolated 20 kHz center-aligned ESP32-S3 GPIO qualification passed 179 shutdown transitions on Arduino-ESP32 2.0.17 and 168 on 3.3.8. Observed latest post-EN rises were 2.7125 µs and 0.7625 µs respectively. These are sample maxima for the scored GPIO windows.
 

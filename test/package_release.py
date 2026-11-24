@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and inspect both release archives from the bytes of an exact Git commit."""
+"""Build release references from the bytes of an exact Git commit."""
 
 import argparse
 import hashlib
@@ -12,8 +12,9 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import zipfile
 
-from check_distribution import public_files
+from check_distribution import distribution_files
 
 
 def git(repository, *args):
@@ -30,7 +31,7 @@ def export_commit(repository, commit, destination):
     if git(repository, "rev-parse", "--verify", f"{commit}^{{commit}}").decode().strip() != commit:
         raise ValueError("The release SHA must identify a commit")
 
-    files = set()
+    entries = {}
     for entry in git(repository, "ls-tree", "-rz", commit).split(b"\0")[:-1]:
         metadata, name = entry.decode("utf-8").split("\t", 1)
         mode, kind, blob = metadata.split()
@@ -39,22 +40,24 @@ def export_commit(repository, commit, destination):
                 not parts or parts[0] == "/" or ".." in parts or
                 any(piece in ("AGENTS.md", ".lmb", ".agents", ".codex", ".pio") for piece in parts)):
             raise ValueError(f"Non-public or unsupported release entry: {name}")
-        path = destination / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("xb") as output:
-            subprocess.run(["git", "-C", repository, "cat-file", "blob", blob],
-                           stdout=output, check=True)
-        files.add(name)
-    expected = {path.relative_to(destination).as_posix() for path in public_files(destination)}
+        entries[name] = (mode, blob)
+    files = set(entries)
+    expected = set(distribution_files()["github"])
     if files != expected:
         raise ValueError(f"Release tree differs from public inventory: extra={sorted(files - expected)}, "
                          f"missing={sorted(expected - files)}")
+    for name, (mode, blob) in entries.items():
+        path = destination / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("xb") as output:
+            output.write(git(repository, "cat-file", "blob", blob))
+        path.chmod(0o755 if mode == "100755" else 0o644)
     return files
 
 
-def inspect_registry(archive, source, files):
+def inspect_registry(archive, source):
     """Compare the actual PlatformIO tarball to committed public bytes."""
-    expected = {name for name in files if not name.startswith("test/")}
+    expected = set(distribution_files()["platformio"])
     actual = set()
     with tarfile.open(archive, "r:gz") as package:
         for member in package:
@@ -77,14 +80,18 @@ def main():
     parser.add_argument("output", type=Path, help="new directory for the verified archives")
     parser.add_argument("--repository", type=Path, default=Path(__file__).resolve().parents[1])
     args = parser.parse_args()
+    repository = args.repository.resolve()
 
     with tempfile.TemporaryDirectory(prefix="esp32-mcpwm-release-") as temp:
         scratch = Path(temp)
         source = scratch / "source"
-        files = export_commit(args.repository.resolve(), args.commit, source)
-        version = json.loads((source / "library.json").read_text())["version"]
+        files = export_commit(repository, args.commit, source)
+        manifest = json.loads((source / "library.json").read_text())
+        version = manifest["version"]
         if not re.fullmatch(r"\d+\.\d+\.\d+", version):
             raise ValueError("Unexpected release version")
+        if manifest.get("export") != {"include": list(distribution_files()["platformio"])}:
+            raise ValueError("PlatformIO export rules differ from the positive inventory")
         source_zip = scratch / f"ESP32_MCPWM-{version}.zip"
         registry_tar = scratch / f"ESP32_MCPWM-{version}.tar.gz"
 
@@ -92,10 +99,22 @@ def main():
                        check=True)
         subprocess.run([os.environ.get("PIO", "pio"), "pkg", "pack", source, "--output", registry_tar],
                        check=True)
-        registry_files = inspect_registry(registry_tar, source, files)
+        registry_files = inspect_registry(registry_tar, source)
+        archives = [(source_zip, files), (registry_tar, registry_files)]
+        inventories = distribution_files()
+        for channel, archive_format in (("github", "zip"), ("github", "tar.gz"), ("arduino", "zip")):
+            reference = scratch / f"{channel}-ESP32_MCPWM-{version}.{archive_format}"
+            inventory = inventories[channel]
+            reference.write_bytes(git(repository, "archive", f"--format={archive_format}",
+                                      f"--prefix=ESP32_MCPWM-{version}/", args.commit, "--", *inventory))
+            if channel == "arduino":
+                with zipfile.ZipFile(reference, "a") as package:
+                    package.comment = b""
+            archives.append((reference, inventory))
+
         result = {"commit": args.commit, "version": version, "archives": {}}
         args.output.mkdir()
-        for archive, inventory in ((source_zip, files), (registry_tar, registry_files)):
+        for archive, inventory in archives:
             shutil.copyfile(archive, args.output / archive.name)
             result["archives"][archive.name] = {
                 "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),

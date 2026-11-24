@@ -76,13 +76,25 @@ python3 -B test/test_release_metadata.py VERSION DATE TAG NOTES_FILE
 These checks verify metadata. Final-commit CI and the applicable hardware and
 publication gates are tracked separately in the release checklist.
 
-Build both release archives from a full Git commit SHA with
+Build the release references from a full Git commit SHA with
 `python3 -B test/package_release.py COMMIT OUTPUT_DIRECTORY`. Run it with the
-release toolchain, including PlatformIO Core and both host compilers. The command
+protected release toolchain, including PlatformIO Core 6.1.19 and both host compilers. The command
 exports committed public blobs, runs the strict source ZIP check, and validates
-the actual PlatformIO archive against the exported bytes. It reports the archive
-digests and inventories. PlatformIO's library package excludes the test tree,
-which is included in the source ZIP.
+the actual PlatformIO archive against the exported bytes. It also generates
+reference archives for the two generated GitHub source formats and the Arduino
+Library Manager ZIP, and reports archive digests and inventories.
+
+`check_distribution.py` owns the complete GitHub file list and the PlatformIO
+and Arduino projections. The PlatformIO manifest must list the same 21 public
+files as the packager. Arduino Library Manager indexes the source without the
+GitHub workflow and root dotfiles.
+
+Use the LMB Harness v4.1.0 procedure in `RELEASE_DISTRIBUTION.md` for readiness,
+publication and public verification. Normalize the raw PlatformIO archive with
+the Harness before approval. Submit the normalized archive and the GitHub and
+Arduino references to the protected distribution check. Record the exact commit,
+final CI and the independent review before requesting artifact-bound owner
+authorization. Confirm each public download after publication.
 
 ## Target compile
 

@@ -4,6 +4,19 @@ All notable changes to ESP32_MCPWM are documented here.
 
 ## [Unreleased]
 
+## [2.1.2] - 2026-11-24
+
+### Fixed
+
+- Limit installable distributions to explicit public file inventories.
+- Exclude internal engineering files and machine-local artifacts from packages.
+
+### Changed
+
+- Bind publication to reviewed release artifacts and require independent
+  verification of public downloads.
+- Preserve the qualified v2.1.1 motor-control implementation and public API.
+
 ## [2.1.1] - 2026-11-24
 
 ### Fixed

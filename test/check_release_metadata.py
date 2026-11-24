@@ -49,6 +49,10 @@ def verify(root, release=None):
     target, planned, tag, notes = release
     require(target == version and tag == f'v{version}', 'Proposed tag or release version disagrees with the package')
     require(date.fromisoformat(planned).isoformat() == planned, 'Release date must be ISO YYYY-MM-DD')
+    checklist = read(root, 'RELEASE_CHECKLIST.md')
+    require(one(r'^Target release \*\*([^*]+)\*\*\. Proposed publication \*\*([^*]+)\*\*\.', checklist,
+                'Missing or duplicate checklist target') == (target, planned),
+            'Checklist version or publication date disagrees')
     readme = read(root, 'README.md')
     current = one(r'^Current version:\n\n```text\n([^\n]+)\n```$', readme, 'Missing or duplicate README current version')
     require(current == version, 'README current version is stale')

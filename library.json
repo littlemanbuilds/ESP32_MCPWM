@@ -1,6 +1,6 @@
 {
   "name": "ESP32_MCPWM",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "description": "Explicit Arduino-ESP32 MCPWM H-bridge control with structured operation results, software and hardware fault paths, coast/brake modes, runtime retuning, capture, and diagnostics.",
   "keywords": [
     "arduino",
@@ -31,6 +31,31 @@
   "platforms": ["espressif32"],
   "build": {
     "includeDir": "src"
+  },
+  "export": {
+    "include": [
+      ".clang-format",
+      ".github/workflows/ci.yml",
+      ".gitignore",
+      "CHANGELOG.md",
+      "LICENSE",
+      "README.md",
+      "RELEASE_CHECKLIST.md",
+      "examples/01_BasicMotorControl/01_BasicMotorControl.ino",
+      "examples/02_FreewheelAndDitherBrake/02_FreewheelAndDitherBrake.ino",
+      "examples/03_FaultInputSafety/03_FaultInputSafety.ino",
+      "examples/04_RuntimeFrequencyChange/04_RuntimeFrequencyChange.ino",
+      "examples/05_CaptureInput/05_CaptureInput.ino",
+      "examples/06_TwoMotors/06_TwoMotors.ino",
+      "keywords.txt",
+      "library.json",
+      "library.properties",
+      "platformio.ini",
+      "src/ESP32_MCPWM.h",
+      "src/HBridgeMotor.cpp",
+      "src/HBridgeMotor.h",
+      "src/IMotorDriver.h"
+    ]
   },
   "examples": [
     "examples/01_BasicMotorControl/01_BasicMotorControl.ino",

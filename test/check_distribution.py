@@ -9,24 +9,78 @@ import tempfile
 import zipfile
 
 
+SOURCE_FILES = (
+    ".clang-format",
+    ".github/workflows/ci.yml",
+    ".gitignore",
+    "CHANGELOG.md",
+    "LICENSE",
+    "README.md",
+    "RELEASE_CHECKLIST.md",
+    "examples/01_BasicMotorControl/01_BasicMotorControl.ino",
+    "examples/02_FreewheelAndDitherBrake/02_FreewheelAndDitherBrake.ino",
+    "examples/03_FaultInputSafety/03_FaultInputSafety.ino",
+    "examples/04_RuntimeFrequencyChange/04_RuntimeFrequencyChange.ino",
+    "examples/05_CaptureInput/05_CaptureInput.ino",
+    "examples/06_TwoMotors/06_TwoMotors.ino",
+    "keywords.txt",
+    "library.json",
+    "library.properties",
+    "platformio.ini",
+    "src/ESP32_MCPWM.h",
+    "src/HBridgeMotor.cpp",
+    "src/HBridgeMotor.h",
+    "src/IMotorDriver.h",
+    "test/README.md",
+    "test/check_distribution.py",
+    "test/check_examples_host.sh",
+    "test/check_release_contracts.sh",
+    "test/check_release_metadata.py",
+    "test/compile_smoke/compile_smoke.ino",
+    "test/hardware/shutdown/build.py",
+    "test/hardware/shutdown/check_trace.py",
+    "test/hardware/shutdown/main.cpp",
+    "test/hardware/shutdown/qualify.py",
+    "test/hardware/shutdown/trace.h",
+    "test/host_stubs/Arduino.h",
+    "test/mocks/Arduino.h",
+    "test/mocks/driver/gpio.h",
+    "test/mocks/driver/mcpwm.h",
+    "test/mocks/esp_rom_gpio.h",
+    "test/mocks/esp_timer.h",
+    "test/mocks/freertos/portmacro.h",
+    "test/mocks/mock_hal.cpp",
+    "test/mocks/mock_hal.h",
+    "test/mocks/soc/gpio_sig_map.h",
+    "test/mocks/soc/mcpwm_reg.h",
+    "test/mocks/soc/soc.h",
+    "test/mocks/soc/soc_caps.h",
+    "test/native/test_commissioning.cpp",
+    "test/native/test_concurrency.cpp",
+    "test/native/test_interface.cpp",
+    "test/native/test_startup_state.cpp",
+    "test/package_release.py",
+    "test/run_host_checks.sh",
+    "test/run_native_tests.sh",
+    "test/run_sanitizers.sh",
+    "test/run_tsan.sh",
+    "test/test_release_metadata.py",
+    "test/test_release_packaging.py",
+)
+
+
 def public_files(root):
-    """Return the repository's intended public source ZIP inventory."""
-    files = [root / name for name in (
-        ".clang-format", ".gitignore", "CHANGELOG.md", "LICENSE", "README.md",
-        "RELEASE_CHECKLIST.md", "keywords.txt", "library.json", "library.properties",
-        "platformio.ini", ".github/workflows/ci.yml",
-    )]
-    for directory in ("src", "examples", "test"):
-        for path in (root / directory).rglob("*"):
-            relative = path.relative_to(root / directory)
-            if any(part.startswith(".") for part in relative.parts) or relative.parts[0] == "build":
-                continue
-            if path.is_dir():
-                continue
-            if path.suffix not in (".h", ".cpp", ".ino", ".sh", ".py", ".md"):
-                raise RuntimeError(f"Unexpected source-package file: {path.relative_to(root)}")
-            files.append(path)
-    return sorted(files)
+    """Return the explicit public GitHub source inventory."""
+    return [root / name for name in SOURCE_FILES]
+
+
+def distribution_files():
+    """Return positive projections of the reviewed GitHub source inventory."""
+    return {
+        "github": SOURCE_FILES,
+        "platformio": tuple(name for name in SOURCE_FILES if not name.startswith("test/")),
+        "arduino": tuple(name for name in SOURCE_FILES if not name.startswith(".")),
+    }
 
 
 def main():

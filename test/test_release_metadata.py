@@ -12,7 +12,7 @@ from check_release_metadata import read, verify
 
 
 FILES = ('src/ESP32_MCPWM.h', 'library.properties', 'library.json', 'README.md',
-         'CHANGELOG.md', '.github/workflows/ci.yml')
+         'CHANGELOG.md', 'RELEASE_CHECKLIST.md', '.github/workflows/ci.yml')
 
 
 def run(root, release):
@@ -31,6 +31,10 @@ def run(root, release):
         ('src/ESP32_MCPWM.h', f'VERSION_MINOR {minor}', f'VERSION_MINOR {minor + 1}', 'Numeric version macros disagree'),
         ('library.properties', f'version={target}', f'version={wrong}', 'Package versions disagree'),
         ('library.json', f'"version": "{target}"', f'"version": "{wrong}"', 'Package versions disagree'),
+        ('RELEASE_CHECKLIST.md', f'Target release **{target}**', f'Target release **{wrong}**',
+         'Checklist version or publication date disagrees'),
+        ('RELEASE_CHECKLIST.md', f'Proposed publication **{planned}**', f'Proposed publication **{wrong_date}**',
+         'Checklist version or publication date disagrees'),
         ('CHANGELOG.md', heading, f'## [{wrong}]', 'Missing or duplicate target changelog section'),
         ('CHANGELOG.md', heading, f'{heading}\n\n{heading}', 'Missing or duplicate target changelog section'),
         ('CHANGELOG.md', f'{heading} - {planned}', heading, 'Target changelog date disagrees'),

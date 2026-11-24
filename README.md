@@ -686,7 +686,9 @@ and leaves the outputs disabled. A subsequent compare, restart, or dither
 failure can return an error after the new request was programmed. Check both
 the operation result and status, and recover before commanding drive.
 
-When upgrading from v2.1.0 to v2.1.1, rebuild with the new version. After HiZ
+When upgrading from v2.1.1 to v2.1.2, update the dependency version and rebuild.
+This release changes distribution packaging. Motor behavior and the public API
+remain the same. After HiZ
 coast or successful recovery, issue fresh drive demand and check the result.
 Allow for a quiet timer boundary when PWM resumes. After stop, use the existing
 `start()` lifecycle before requesting drive.
@@ -1147,7 +1149,7 @@ ESP32_MCPWM/
 Current version:
 
 ```text
-2.1.1
+2.1.2
 ```
 
 See [CHANGELOG.md](CHANGELOG.md) for detailed release history.
