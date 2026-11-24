@@ -16,6 +16,24 @@ Focused regressions also cover timer/signal mapping, instance ownership/reuse/qu
 
 The same script also runs a synchronized ISR/task concurrency stress case.
 
+The shutdown-aperture regression runs the production backend with a buffered
+comparator model. It checks EN and pad routing before compare writes, including
+pending demand, both directions, timer phases, stop and software fault coast.
+Separate stale-compare timing simulation demonstrates the released failure
+condition with an injected write delay. That delay is a model input. On
+restoration, the quiet-route witness rejects reconnecting with a nonzero active
+compare, and fault or timer-event loss must retain suppression.
+
+The isolated target fixture in `hardware/shutdown` adds shared-clock GPIO edge
+capture and independent pulse counting. Separate capture registers time rising
+and falling edges on the active PWM route. The opposite route keeps an
+independent pulse counter, so activity there rejects the trial. Its schedule covers six forward
+command/operation pairs across all eight measured phase bins, followed by targeted
+reverse-route checks from quiet. It checks at most one rising edge after EN
+withdrawal within one 20 kHz period, idle and wiring checks, quiet recovery, and
+final inactivity. It is intended for an unloaded ESP32-S3 with USB logic power
+and the loopbacks encoded in the fixture.
+
 ## Sanitizers
 
 ```bash
@@ -57,6 +75,14 @@ python3 -B test/test_release_metadata.py VERSION DATE TAG NOTES_FILE
 
 These checks verify metadata. Final-commit CI and the applicable hardware and
 publication gates are tracked separately in the release checklist.
+
+Build both release archives from a full Git commit SHA with
+`python3 -B test/package_release.py COMMIT OUTPUT_DIRECTORY`. Run it with the
+release toolchain, including PlatformIO Core and both host compilers. The command
+exports committed public blobs, runs the strict source ZIP check, and validates
+the actual PlatformIO archive against the exported bytes. It reports the archive
+digests and inventories. PlatformIO's library package excludes the test tree,
+which is included in the source ZIP.
 
 ## Target compile
 

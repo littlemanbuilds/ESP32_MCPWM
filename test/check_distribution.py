@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Build a deterministic source ZIP and run host checks without executable bits."""
 
+import argparse
 import hashlib
 from pathlib import Path
 import subprocess
@@ -8,9 +9,8 @@ import tempfile
 import zipfile
 
 
-def main():
-    """Verify the public source package and return its unpacked host-check status."""
-    root = Path(__file__).resolve().parents[1]
+def public_files(root):
+    """Return the repository's intended public source ZIP inventory."""
     files = [root / name for name in (
         ".clang-format", ".gitignore", "CHANGELOG.md", "LICENSE", "README.md",
         "RELEASE_CHECKLIST.md", "keywords.txt", "library.json", "library.properties",
@@ -26,7 +26,16 @@ def main():
             if path.suffix not in (".h", ".cpp", ".ino", ".sh", ".py", ".md"):
                 raise RuntimeError(f"Unexpected source-package file: {path.relative_to(root)}")
             files.append(path)
-    files.sort()
+    return sorted(files)
+
+
+def main():
+    """Verify the public source package and return its unpacked host-check status."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, help="save the verified source ZIP")
+    arguments = parser.parse_args()
+    root = Path(__file__).resolve().parents[1]
+    files = public_files(root)
     with tempfile.TemporaryDirectory(prefix="esp32-mcpwm-package-") as temporary:
         temporary = Path(temporary)
         archive = temporary / "ESP32_MCPWM.zip"
@@ -48,6 +57,9 @@ def main():
                 raise RuntimeError(f"Archive content mismatch: {path}")
         result = subprocess.run(["sh", "test/run_host_checks.sh", "--unpacked"], cwd=unpacked, check=False)
         if result.returncode == 0:
+            if arguments.output:
+                with arguments.output.open("xb") as output:
+                    output.write(archive.read_bytes())
             print("PASS: deterministic source ZIP and unpacked host checks", flush=True)
         return result.returncode
 

@@ -19,4 +19,5 @@ done
 CXX="$CLANG_CXX" bash "$ROOT/test/run_sanitizers.sh"
 CXX="$CLANG_CXX" bash "$ROOT/test/run_tsan.sh"
 bash "$ROOT/test/check_release_contracts.sh"
+python3 -B "$ROOT/test/test_release_packaging.py"
 echo "ESP32_MCPWM host checks: PASS"

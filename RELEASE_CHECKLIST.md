@@ -1,14 +1,14 @@
 # ESP32_MCPWM release checklist
 
-Target release **2.1.0**. Planned publication **2026-11-22**. Confirm the date before tagging and update the changelog and release metadata if the date changes.
+Target release **2.1.1**. Proposed publication **2026-11-24**. Synchronize the changelog and release metadata with the intended publication date before final commit qualification.
 
 Publication is on hold pending final-commit CI and the open release gates below. Checked source, API, example and documentation items record earlier review of the relevant source and examples. They carry no hardware or publication claim.
 
 ## Release preparation
 
-- [x] Version string, numeric macros and both package manifests agree on 2.1.0.
+- [x] Version string, numeric macros and both package manifests agree on 2.1.1.
 - [x] README current version and migration direction agree with the target release.
-- [x] One dated v2.1.0 changelog entry covers the consolidated changes and `[Unreleased]` is empty. The v2.0.0, v1.3.0 and earlier entries are preserved.
+- [x] One dated v2.1.1 changelog entry covers the correction and `[Unreleased]` is empty. The v2.1.0 and earlier entries are preserved.
 - [ ] Confirm the actual publication date, proposed tag and final release notes against both manifests before tagging.
 - [ ] Confirm the final public diff, source ZIP and registry package against the exact release commit.
 
@@ -54,17 +54,21 @@ Publication is on hold pending final-commit CI and the open release gates below.
 
 ## Automated validation
 
-The earlier qualified implementation passed strict C++11 GNU GCC and Clang tests, ASan/UBSan, TSan, commissioning with the API enabled and disabled, host syntax checks for all six examples, and pinned ESP32-S3 and classic ESP32 smoke builds. The implementation and public examples are unchanged. Previous remote CI also compiled the six ESP32-S3 examples. Packaging and final-commit CI require their own evidence.
+The shutdown correction passed strict C++11 GNU GCC and Clang tests, ASan/UBSan,
+TSan, the exact released-backend negative regression, both ESP32-S3 SDK builds
+and the pinned current SDK smoke sketch and six examples.
 
 - [ ] `final-source-zip` — exact final source ZIP unpacked and validated, including host checks and release contracts.
 - [ ] `final-registry-package` — exact final PlatformIO archive reviewed for public files, contents and package version.
-- [ ] `final-remote-ci` — host and source ZIP checks, ESP32-S3 smoke build and all six public examples pass on the final amended commit with Python 3.11 and PlatformIO Core 6.1.19.
+- [ ] `final-remote-ci` — host and source ZIP checks, ESP32-S3 smoke build and all six public examples pass on the exact final commit with Python 3.11 and PlatformIO Core 6.1.19.
 
 ## Isolated ESP32-S3 bench
 
 Earlier logic-only observations include center-aligned 20 kHz steady PWM, immediate 16 Hz timer reuse, EN-less running-retune rejection, software and peripheral fault transitions, and GPIO teardown. Separate destruction-marker captures showed EN and each PWM pin low in the observed windows. The 500 kHz percentage midpoint passed in up- and down-count modes with operator-reported 2.000 µs period and 1.000 µs HIGH on PWM B. These observations cover the captured windows and setup only, including no measurement of pull-down strength or simultaneous three-pin release.
 
 Release hardware items below remain open. A completed item requires evidence for the full stated scope. No deferral has been approved.
+
+- [x] `hw-shutdown-20khz` — isolated 20 kHz center-aligned ESP32-S3 GPIO qualification passed 179 shutdown transitions on Arduino-ESP32 2.0.17 and 168 on 3.3.8. Observed latest post-EN rises were 2.7125 µs and 0.7625 µs respectively. These are sample maxima for the scored GPIO windows.
 
 - [ ] `hw-output` — complete logic-level drive/coast/disable truth table and remaining supported-mode frequency and duty endpoints.
 - [ ] `hw-reuse` — characterize low-frequency lifecycle, resource reuse, failed-recovery containment and enabled commissioning on hardware.

@@ -457,6 +457,11 @@ MotorSetupResult HBridgeMotor::setup(const MotorMCPWMConfig &hw, const MotorBeha
     {
         setOutputMode(MotorOutputMode::FaultContainment);
     }
+    else if (beh_.freewheel_mode == FreewheelMode::HiZ)
+    {
+        // startTimer() already proved a quiet generator cycle with EN low.
+        (void)result(MotorOperation::Coast, MotorOperationError::None, false);
+    }
     else
     {
         const MotorOperationResult coast_result = coast();
@@ -578,7 +583,7 @@ MotorOperationResult HBridgeMotor::coast() noexcept
     switch (beh_.freewheel_mode)
     {
     case FreewheelMode::HiZ:
-        ok = commandOutput(false, 0.0f, 0.0f);
+        ok = commandOutput(false, 0.0f, 0.0f, canSuppressCoast());
         break;
     case FreewheelMode::HiZ_Awake:
         ok = commandOutput(true, 0.0f, 0.0f);
@@ -889,15 +894,13 @@ MotorOperationResult HBridgeMotor::start() noexcept
     switch (beh_.freewheel_mode)
     {
     case FreewheelMode::HiZ:
-        ok = commandOutput(false, 0.0f, 0.0f);
+        ok = commandOutput(false, 0.0f, 0.0f, canSuppressCoast());
         break;
     case FreewheelMode::HiZ_Awake:
     {
-        lockState();
         const bool fault = hasFault() || (hardware_fault_enabled_ && hardwareFaultInputActive());
         if (!fault)
             ok = commandOutput(true, 0.0f, 0.0f);
-        unlockState();
         if (fault)
         {
             setOutputMode(MotorOutputMode::FaultContainment);
@@ -1292,6 +1295,13 @@ MotorOperationError HBridgeMotor::startSoftBrake() noexcept
                    : MotorOperationError::HardwareWriteFailed;
     }
 
+    // Reconnect at zero in the caller's task before arming the dither
+    // timer. Its shared callback can then commit phases without waiting.
+    if (restoreCoastRoutes(++output_sequence_) != OutputCommitResult::Committed)
+    {
+        unlockState();
+        return MotorOperationError::HardwareWriteFailed;
+    }
     soft_phase_ = BrakePhase::Coast;
     soft_active_ = true;
     const uint32_t sequence = ++soft_sequence_;
@@ -1407,7 +1417,7 @@ bool HBridgeMotor::recomputeSoftDurations() noexcept
 // ---- Hardware output ---- //
 
 HBridgeMotor::OutputCommitResult HBridgeMotor::writeHardwareOutput(uint32_t sequence, bool enable, float a_percent,
-                                                                   float b_percent) noexcept
+                                                                   float b_percent, bool suppress_pwm) noexcept
 {
     // state_mux_ is deliberately held by the caller from the freshness check
     // through each physical commit. This is the linearization boundary between
@@ -1422,15 +1432,34 @@ HBridgeMotor::OutputCommitResult HBridgeMotor::writeHardwareOutput(uint32_t sequ
 
     const bool enable_controlled = use_en_;
     const bool enable_asserted = en_state_;
-    const uint32_t period = counter_mode_ == MCPWM_UP_COUNTER ? 0U : timerPeriod(mcpwm_unit_, mcpwm_timer_);
-    const auto writeDuty = [&](mcpwm_operator_t channel, float percent) {
-        return mcpwm_set_duty(mcpwm_unit_, mcpwm_timer_, channel, comparatorDuty(counter_mode_, period, percent));
-    };
-
     const float last_a = last_a_percent_;
     const float last_b = last_b_percent_;
 
     const bool both_change = a_percent != last_a && b_percent != last_b;
+
+    if (!enable || (enable_controlled && enable_asserted && both_change))
+    {
+        if (enable_controlled && en_state_)
+        {
+            digitalWrite(en_pin_, LOW);
+            en_state_ = false;
+        }
+    }
+
+    if (sequence != output_sequence_)
+        return OutputCommitResult::Stale;
+
+    if (suppress_pwm && !pwm_isolated_ && !pwm_coast_suppressed_)
+    {
+        if (!routePwmLow())
+            return OutputCommitResult::HardwareFailed;
+        pwm_coast_suppressed_ = true;
+    }
+
+    const uint32_t period = counter_mode_ == MCPWM_UP_COUNTER ? 0U : timerPeriod(mcpwm_unit_, mcpwm_timer_);
+    const auto writeDuty = [&](mcpwm_operator_t channel, float percent) {
+        return mcpwm_set_duty(mcpwm_unit_, mcpwm_timer_, channel, comparatorDuty(counter_mode_, period, percent));
+    };
 
     const auto contain_after_failure = [this, sequence, &writeDuty]() -> OutputCommitResult
     {
@@ -1450,18 +1479,6 @@ HBridgeMotor::OutputCommitResult HBridgeMotor::writeHardwareOutput(uint32_t sequ
             last_b_percent_ = 0.0f;
         return (sequence == output_sequence_) ? OutputCommitResult::HardwareFailed : OutputCommitResult::Stale;
     };
-
-    if (!enable || (enable_controlled && enable_asserted && both_change))
-    {
-        if (enable_controlled && en_state_)
-        {
-            digitalWrite(en_pin_, LOW);
-            en_state_ = false;
-        }
-    }
-
-    if (sequence != output_sequence_)
-        return OutputCommitResult::Stale;
 
     if (a_percent != last_a_percent_)
     {
@@ -1500,17 +1517,77 @@ HBridgeMotor::OutputCommitResult HBridgeMotor::writeHardwareOutput(uint32_t sequ
     return OutputCommitResult::Committed;
 }
 
-bool HBridgeMotor::commandOutput(bool enable, float a_percent, float b_percent) noexcept
+bool HBridgeMotor::commandOutput(bool enable, float a_percent, float b_percent, bool suppress_pwm,
+                                 bool allow_fault) noexcept
 {
     lockState();
+    if (enable && !allow_fault && (fault_latched_ || recovery_inhibited_ ||
+                                  hardware_fault_active_ || hardware_fault_latched_ ||
+                                  (safety_.fault_gpio >= 0 && faultInputActive()) ||
+                                  (hardware_fault_enabled_ && hardwareFaultInputActive())))
+    {
+        unlockState();
+        return false;
+    }
     commanded_enable_ = enable;
     commanded_a_percent_ = a_percent;
     commanded_b_percent_ = b_percent;
     const uint32_t sequence = ++output_sequence_;
-    const OutputCommitResult committed = writeHardwareOutput(sequence, enable, a_percent, b_percent);
+    OutputCommitResult committed = enable ? restoreCoastRoutes(sequence, allow_fault) : OutputCommitResult::Committed;
+    if (committed == OutputCommitResult::Committed)
+        committed = writeHardwareOutput(sequence, enable, a_percent, b_percent, suppress_pwm);
     unlockState();
 
     return committed == OutputCommitResult::Committed;
+}
+
+bool HBridgeMotor::canSuppressCoast() const noexcept
+{
+    return use_en_ && !hardware_fault_enabled_ && !deadtime_enabled_;
+}
+
+HBridgeMotor::OutputCommitResult HBridgeMotor::restoreCoastRoutes(uint32_t sequence, bool allow_fault) noexcept
+{
+    if (!pwm_coast_suppressed_ || pwm_isolated_ || !mcpwm_running_)
+        return OutputCommitResult::Committed;
+
+    // A failed zero write can leave an old shadow compare queued. Retry zero
+    // staging before starting the event proof if a compare is still pending.
+    if (last_a_percent_ != 0.0f || last_b_percent_ != 0.0f)
+    {
+        const OutputCommitResult zeroed = writeHardwareOutput(sequence, false, 0.0f, 0.0f);
+        if (zeroed != OutputCommitResult::Committed)
+            return zeroed;
+    }
+
+    const uint32_t fault_sequence = fault_sequence_;
+    const uint32_t timer = static_cast<uint32_t>(mcpwm_timer_);
+    const uint32_t peak = MCPWM_TIMER0_TEP_INT_RAW << timer;
+    const uint32_t zero = MCPWM_TIMER0_TEZ_INT_RAW << timer;
+    const mcpwm_unit_t unit = mcpwm_unit_;
+    REG_WRITE(MCPWM_INT_CLR_REG(unit), peak);
+    unlockState();
+    const bool reached_peak = waitForTimerEvent(unit, peak);
+    REG_WRITE(MCPWM_INT_CLR_REG(unit), zero);
+    const bool reached_zero = reached_peak && waitForTimerEvent(unit, zero);
+    lockState();
+
+    if (sequence != output_sequence_ || fault_sequence != fault_sequence_ ||
+        (!allow_fault && (fault_latched_ || recovery_inhibited_ ||
+                          (safety_.fault_gpio >= 0 && faultInputActive()))))
+        return OutputCommitResult::Stale;
+    if (!reached_zero || !mcpwm_running_ || !pwm_coast_suppressed_ || pwm_isolated_ || en_state_)
+        return OutputCommitResult::HardwareFailed;
+
+    // The original MCPWM GPIO initialization configured these pads as
+    // matrix outputs. Change only their signal selection while EN is low.
+    const uint32_t base = unit == MCPWM_UNIT_0 ? PWM0_OUT0A_IDX : PWM1_OUT0A_IDX;
+    esp_rom_gpio_connect_out_signal(static_cast<uint32_t>(lpwm_pin_), base + static_cast<uint32_t>(mcpwm_sig_l_),
+                                    false, false);
+    esp_rom_gpio_connect_out_signal(static_cast<uint32_t>(rpwm_pin_), base + static_cast<uint32_t>(mcpwm_sig_r_),
+                                    false, false);
+    pwm_coast_suppressed_ = false;
+    return OutputCommitResult::Committed;
 }
 
 HBridgeMotor::TimerCommandResult HBridgeMotor::writeTimerUntilCurrent(uint32_t sequence, bool active,
@@ -1613,7 +1690,8 @@ MotorOperationError HBridgeMotor::applyFaultAction() noexcept
     switch (safety_.fault_action)
     {
     case FaultAction::Coast:
-        return commandOutput(false, 0.0f, 0.0f) ? MotorOperationError::None : MotorOperationError::HardwareWriteFailed;
+        return commandOutput(false, 0.0f, 0.0f, canSuppressCoast()) ? MotorOperationError::None
+                                                                    : MotorOperationError::HardwareWriteFailed;
 
     case FaultAction::DisableOutputs:
     {
@@ -1635,7 +1713,8 @@ MotorOperationError HBridgeMotor::emergencyBrake() noexcept
     if (startTimer() != MotorOperationError::None)
         return MotorOperationError::HardwareStartFailed;
 
-    return commandOutput(true, 100.0f, 100.0f) ? MotorOperationError::None : MotorOperationError::HardwareWriteFailed;
+    return commandOutput(true, 100.0f, 100.0f, false, true) ? MotorOperationError::None
+                                                            : MotorOperationError::HardwareWriteFailed;
 }
 
 void HBridgeMotor::detachFaultInterrupt() noexcept
@@ -1877,30 +1956,36 @@ void HBridgeMotor::detachCaptureInterrupt() noexcept
 
 // ---- Setup / teardown helpers ---- //
 
-bool HBridgeMotor::isolatePwm() noexcept
+bool HBridgeMotor::routePwmLow() noexcept
 {
     // Take the GPIO matrix route away from MCPWM. A low GPIO latch bypasses
     // generator, compare and dead-time state even without a bridge enable pin.
     const auto left = static_cast<gpio_num_t>(lpwm_pin_);
     const auto right = static_cast<gpio_num_t>(rpwm_pin_);
-    bool isolated = false;
-    if (gpio_set_level(left, 0) == ESP_OK && gpio_set_level(right, 0) == ESP_OK)
-    {
-        // The pad changes are sequential. Keep task preemption out of the
-        // interval, and configure the already-rerouted pads after releasing.
-        lockState();
-        esp_rom_gpio_connect_out_signal(static_cast<uint32_t>(left), SIG_GPIO_OUT_IDX, false, false);
-        esp_rom_gpio_connect_out_signal(static_cast<uint32_t>(right), SIG_GPIO_OUT_IDX, false, false);
-        unlockState();
+    if (gpio_set_level(left, 0) != ESP_OK || gpio_set_level(right, 0) != ESP_OK)
+        return false;
+    esp_rom_gpio_connect_out_signal(static_cast<uint32_t>(left), SIG_GPIO_OUT_IDX, false, false);
+    esp_rom_gpio_connect_out_signal(static_cast<uint32_t>(right), SIG_GPIO_OUT_IDX, false, false);
+    return true;
+}
 
+bool HBridgeMotor::isolatePwm() noexcept
+{
+    lockState();
+    const bool disconnected = pwm_coast_suppressed_ || routePwmLow();
+    unlockState();
+    bool isolated = false;
+    if (disconnected)
+    {
         gpio_config_t output{};
-        output.pin_bit_mask = (UINT64_C(1) << static_cast<uint32_t>(left)) |
-                              (UINT64_C(1) << static_cast<uint32_t>(right));
+        output.pin_bit_mask = (UINT64_C(1) << static_cast<uint32_t>(lpwm_pin_)) |
+                              (UINT64_C(1) << static_cast<uint32_t>(rpwm_pin_));
         output.mode = GPIO_MODE_OUTPUT;
         isolated = gpio_config(&output) == ESP_OK;
     }
     lockState();
     pwm_isolated_ = isolated;
+    pwm_coast_suppressed_ = false;
     unlockState();
     return isolated;
 }
@@ -1996,14 +2081,10 @@ MotorOperationError HBridgeMotor::startTimer(bool abort_on_fault) noexcept
 
 MotorOperationError HBridgeMotor::quiesceTimer() noexcept
 {
-    // EN must fall before either PWM pad is remapped. On a bridge without
-    // EN, isolate both pads before committing buffered compare changes.
-    bool isolated = false;
-    if (!use_en_)
-        isolated = isolatePwm();
-    const bool zeroed = commandOutput(false, 0.0f, 0.0f);
-    if (use_en_)
-        isolated = isolatePwm();
+    // Withdraw EN and remove both timer routes in the same output commit,
+    // ahead of all buffered compare writes and the timer stop request.
+    const bool zeroed = commandOutput(false, 0.0f, 0.0f, true);
+    const bool isolated = isolatePwm();
     const bool stopped = stopTimer();
     lockState();
     output_mode_ = (isolated || (use_en_ && !en_state_)) ? MotorOutputMode::Disabled : MotorOutputMode::Uncertain;
@@ -2069,6 +2150,7 @@ MotorSetupError HBridgeMotor::prepareForSetup() noexcept
     timer_stop_pending_ = false;
     timer_recovery_required_ = false;
     pwm_isolated_ = false;
+    pwm_coast_suppressed_ = false;
     deadtime_enabled_ = false;
     hardware_fault_enabled_ = false;
     hardware_fault_ = MotorHardwareFaultConfig{};

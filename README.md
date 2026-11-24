@@ -131,7 +131,7 @@ compilation was also recorded for v2.1.0; it is not a separate routine CI gate.
 
 ESP32-S2 and ESP32-C3 are **not** listed as supported targets for this release because the pinned legacy MCPWM API is not available for those targets in this release configuration.
 
-The authoritative v2.1.0 release baseline is:
+The pinned release CI baseline is:
 
 - PlatformIO Core 6.1.19;
 - pioarduino Espressif32 55.03.38;
@@ -143,7 +143,9 @@ A successful compile does not prove that every peripheral signal can be routed t
 
 ### ESP-IDF driver generation
 
-v2.1.0 uses the legacy `driver/mcpwm.h` API currently provided by Arduino-ESP32 3.x / ESP-IDF 5.x. ESP-IDF 6 removes that legacy driver in favor of the newer MCPWM prelude/object API.
+The library uses the legacy `driver/mcpwm.h` API. Isolated ESP32-S3 shutdown
+qualification covered Arduino-ESP32 2.0.17 / ESP-IDF 4.4.7 and Arduino-ESP32
+3.3.8 / ESP-IDF 5.5.4. ESP-IDF 6 removes that legacy driver in favor of the MCPWM prelude/object API.
 
 That future backend migration should be handled as a dedicated library release rather than mixing two driver architectures into this release. The public motor concepts introduced in v2 are intentionally suitable for either backend.
 
@@ -369,6 +371,17 @@ The three freewheel modes are:
 - `FreewheelMode::DitherBrake` — repeated configured brake/coast phases.
 
 The physical meaning of `HiZ_Awake` depends on the H-bridge truth table. The name describes what the library drives, not a universal motor-current guarantee.
+
+For ordinary EN-controlled PWM, HiZ coast withdraws EN, routes both PWM pads to
+low GPIO latches, then stages zero duty. The same sequence applies to a software
+fault configured to coast when the application handles it with `pollFaults()`.
+The timer keeps running. An explicit new drive or brake command confirms a quiet
+timer boundary before reconnecting PWM. Elapsed time to resume can therefore
+depend on the configured PWM period. EN-less coast, timed dither phases, and
+ordinary coast with configured peripheral fault or dead-time actions retain their
+generator behavior. Lifecycle stop withdraws EN where available and disconnects
+both pads before staging zero duty and stopping the timer. Pad suppression is an
+electrical signal operation. Bridge coasting depends on the driver truth table.
 
 ### Setup result
 
@@ -673,11 +686,14 @@ and leaves the outputs disabled. A subsequent compare, restart, or dither
 failure can return an error after the new request was programmed. Check both
 the operation result and status, and recover before commanding drive.
 
-When upgrading from v2.0.0 to v2.1.0, or from a development snapshot with
-the earlier frequency behavior, remove any doubled center-aligned frequency
-compensation. Check the 16–500,000 Hz limits, freeze-mode rejection,
-and runtime restrictions above. Verify the waveform and electrical duty at the
-chosen operating points before returning the motor to service.
+When upgrading from v2.1.0 to v2.1.1, rebuild with the new version. After HiZ
+coast or successful recovery, issue fresh drive demand and check the result.
+Allow for a quiet timer boundary when PWM resumes. After stop, use the existing
+`start()` lifecycle before requesting drive.
+
+If migrating from a version before v2.1.0 with the earlier frequency behavior,
+remove any doubled center-aligned frequency compensation. Check the 16–500,000 Hz
+limits, freeze-mode rejection, and runtime restrictions above.
 
 ---
 
@@ -1080,8 +1096,8 @@ to improve startup and fault diagnostics and avoid setting local lifecycle flags
 ## Deliberate limitations
 
 - ESP32-specific; this is not a portable generic Arduino PWM library.
-- Verified target compiles are limited to ESP32-S3 and original ESP32 for this release.
-- v2.1.0 uses the legacy ESP-IDF MCPWM driver exposed by current Arduino-ESP32 3.x. A future ESP-IDF 6 backend requires dedicated migration work.
+- v2.1.1 target qualification used ESP32-S3. The original ESP32 Dev Module compile was recorded for v2.1.0.
+- An ESP-IDF 6 backend requires dedicated migration from the legacy MCPWM driver.
 - Software fault actions require `pollFaults()` and are scheduler-dependent.
 - MCPWM hardware fault actions control generator outputs; they do not guarantee external bridge power removal.
 - The legacy hardware fault path in this release is restricted to active-high triggering.
@@ -1131,7 +1147,7 @@ ESP32_MCPWM/
 Current version:
 
 ```text
-2.1.0
+2.1.1
 ```
 
 See [CHANGELOG.md](CHANGELOG.md) for detailed release history.

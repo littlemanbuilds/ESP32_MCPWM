@@ -11,6 +11,7 @@
 
 #include <HBridgeMotor.h>
 #include <mock_hal.h>
+#include <soc/gpio_sig_map.h>
 #include <cmath>
 #include <functional>
 #include <iostream>
@@ -2007,6 +2008,181 @@ void testPercentRangeAndOtherInputScales()
     checkPercentMatchesRaw(motor, Dir::CW, 101.0f, 65535);
 }
 
+void testEnFirstPwmSuppression()
+{
+    using Kind = mock_hal::EventKind;
+    bool modeled_release_violation = false;
+    for (const float duty : {15.0f, 40.0f})
+    {
+        for (const auto direction : {Dir::CW, Dir::CCW})
+        {
+            for (uint32_t phase = 0; phase < 100U; phase += 5U)
+            {
+                mock_hal::reset();
+                HBridgeMotor motor;
+                auto hw = hardware();
+                hw.counter = MCPWM_UP_DOWN_COUNTER;
+                CHECK(motor.setup(hw, behavior(FreewheelMode::HiZ),
+                                  faultConfig(FaultAction::Coast), MotorCaptureConfig{}).ok());
+                mock_hal::observed_enable_pin = hw.en_pin;
+                CHECK(motor.drivePercent(duty, direction).ok());
+                delayMicroseconds(50);
+                auto &timer = mock_hal::pwm_timers[0][0];
+                timer.phase_ticks = phase;
+                const std::size_t route = direction == Dir::CW ? 0U : 1U;
+                const auto old_compare = timer.active_compare[route];
+                CHECK(old_compare != 0U);
+                CHECK(motor.drivePercent(60.0f, direction).ok());
+                CHECK(timer.shadow_compare[route] != old_compare);
+
+                // Model an old centered pulse recurring while a zero write
+                // is delayed. The injected interval is a counterexample to
+                // an aperture guarantee, not a measured SDK latency.
+                uint32_t last_rise = 0;
+                unsigned rises = 0;
+                for (uint32_t elapsed = 1; elapsed <= 138U; ++elapsed)
+                {
+                    if ((phase + elapsed) % timer.cycleTicks() == timer.cycleTicks() - old_compare)
+                    {
+                        last_rise = elapsed;
+                        ++rises;
+                    }
+                }
+                modeled_release_violation |= rises > 1U && last_rise > timer.cycleTicks();
+
+                mock_hal::events.clear();
+                const bool stop = phase % 15U == 0U;
+                const bool fault = phase % 15U == 5U;
+                if (stop)
+                    CHECK(motor.stop().ok());
+                else if (fault)
+                {
+                    mock_hal::pin_levels[10] = HIGH;
+                    mock_hal::invokeInterrupt(10);
+                    CHECK(motor.pollFaults().ok());
+                }
+                else
+                    CHECK(motor.coast().ok());
+
+                bool en_low = false;
+                unsigned disconnected = 0;
+                bool wrote_zero = false;
+                for (const auto &event : mock_hal::events)
+                {
+                    if (event.kind == Kind::DigitalWrite && event.first == hw.en_pin && event.second == LOW)
+                        en_low = true;
+                    if (event.kind == Kind::PwmMatrix && event.second == static_cast<int>(SIG_GPIO_OUT_IDX))
+                    {
+                        CHECK(en_low);
+                        CHECK(!wrote_zero);
+                        CHECK(event.first == (disconnected == 0U ? hw.lpwm_pin : hw.rpwm_pin));
+                        ++disconnected;
+                    }
+                    if (event.kind == Kind::Duty)
+                    {
+                        CHECK(en_low && disconnected == 2U);
+                        wrote_zero = true;
+                    }
+                }
+                CHECK(en_low && disconnected == 2U && wrote_zero);
+                CHECK(mock_hal::pwm_routes.empty());
+                CHECK(mock_hal::pin_levels[hw.lpwm_pin] == LOW);
+                CHECK(mock_hal::pin_levels[hw.rpwm_pin] == LOW);
+
+                if (stop)
+                {
+                    CHECK(motor.stop().ok());
+                    CHECK(motor.start().ok());
+                }
+                else if (fault)
+                {
+                    mock_hal::pin_levels[10] = LOW;
+                    mock_hal::invokeInterrupt(10);
+                    CHECK(motor.clearFault().ok());
+                }
+                else
+                {
+                    CHECK(timer.active_compare[route] == old_compare);
+                    CHECK(motor.coast().ok());
+                }
+                CHECK(mock_hal::pin_levels[hw.en_pin] == LOW);
+                CHECK(mock_hal::pwm_routes.empty());
+                CHECK(motor.readback().frequency_hz == 20000U);
+                const auto fresh = direction == Dir::CW ? Dir::CCW : Dir::CW;
+                CHECK(motor.drivePercent(24.0f, fresh).ok());
+                CHECK(mock_hal::pwm_routes.size() == 2U);
+                CHECK(mock_hal::unsafe_routes == 0U);
+                CHECK(mock_hal::remaps_while_enabled == 0U);
+                CHECK(timer.active_compare[route] == 0U);
+                CHECK(timer.shadow_compare[route] == 0U);
+                CHECK(timer.shadow_compare[1U - route] != 0U);
+            }
+        }
+    }
+    CHECK(modeled_release_violation);
+}
+
+void testCoastRestoreWaitRetainsSuppression()
+{
+    mock_hal::reset();
+    HBridgeMotor motor;
+    const auto hw = hardware();
+    CHECK(motor.setup(hw, behavior(FreewheelMode::HiZ),
+                      faultConfig(FaultAction::Coast), MotorCaptureConfig{}).ok());
+    CHECK(motor.drivePercent(40.0f, Dir::CW).ok());
+    delayMicroseconds(50);
+    CHECK(motor.coast().ok());
+    mock_hal::suppress_timer_empty = true;
+    CHECK(!motor.drivePercent(16.0f, Dir::CCW).ok());
+    CHECK(mock_hal::pwm_routes.empty());
+    CHECK(mock_hal::pin_levels[hw.en_pin] == LOW);
+
+    mock_hal::suppress_timer_empty = false;
+    mock_hal::pwm_wait_hook = [] {
+        mock_hal::pin_levels[10] = HIGH;
+        mock_hal::invokeInterrupt(10);
+    };
+    CHECK(!motor.drivePercent(16.0f, Dir::CCW).ok());
+    CHECK(mock_hal::pwm_routes.empty());
+    CHECK(mock_hal::pin_levels[hw.en_pin] == LOW);
+    CHECK(motor.pollFaults().ok());
+    mock_hal::pin_levels[10] = LOW;
+    mock_hal::invokeInterrupt(10);
+    CHECK(motor.clearFault().ok());
+    CHECK(motor.drivePercent(16.0f, Dir::CCW).ok());
+    CHECK(mock_hal::unsafe_routes == 0U);
+}
+
+void testCoastRestoresOwnedRoutes()
+{
+    for (const auto mode : {MCPWM_UP_COUNTER, MCPWM_DOWN_COUNTER, MCPWM_UP_DOWN_COUNTER})
+    {
+        mock_hal::reset();
+        HBridgeMotor first;
+        HBridgeMotor second;
+        auto hw = MotorMCPWMConfig{4, 5, 9, MCPWM_UNIT_1, MCPWM_TIMER_2, MCPWM2A, MCPWM2B};
+        hw.counter = mode;
+        const auto options = behavior(FreewheelMode::HiZ, 128, true);
+        CHECK(first.setup(hardware(), options).ok());
+        CHECK(second.setup(hw, options).ok());
+        CHECK(first.drivePercent(30.0f, Dir::CW).ok());
+        CHECK(second.drivePercent(40.0f, Dir::CCW).ok());
+        delayMicroseconds(50);
+        CHECK(second.coast().ok());
+        CHECK(mock_hal::pwm_routes.count(2) == 1U && mock_hal::pwm_routes.count(3) == 1U);
+        CHECK(mock_hal::pwm_routes.count(4) == 0U && mock_hal::pwm_routes.count(5) == 0U);
+        CHECK(mock_hal::pin_levels[8] == HIGH);
+        CHECK(second.softBrakeNow(128).ok());
+        CHECK(mock_hal::pwm_routes.at(4) == std::make_pair(MCPWM_UNIT_1, MCPWM2A));
+        CHECK(mock_hal::pwm_routes.at(5) == std::make_pair(MCPWM_UNIT_1, MCPWM2B));
+        CHECK(mock_hal::unsafe_routes == 0U);
+        CHECK(mock_hal::last_timer->active);
+        CHECK(mock_hal::pin_levels[9] == LOW);
+        mock_hal::fireTimer(mock_hal::last_timer);
+        CHECK(mock_hal::pin_levels[9] == HIGH);
+    }
+}
+
 void testExactDutyEndpointsAcrossStopAndRestart()
 {
     mock_hal::reset();
@@ -2513,6 +2689,9 @@ int main()
         {"counter modes and modeled electrical endpoints", testCounterModesAndElectricalEndpointsInModel},
         {"500 kHz percentage midpoint and raw equivalence", testPercentMidpointAndRawEquivalence},
         {"percentage range and input scales", testPercentRangeAndOtherInputScales},
+        {"EN-first pad suppression and quiet restore across PWM phases", testEnFirstPwmSuppression},
+        {"coast restore stays suppressed during timeout and fault", testCoastRestoreWaitRetainsSuppression},
+        {"coast restores only its owned routes across counter modes", testCoastRestoresOwnedRoutes},
         {"exact duty endpoints across stop and restart", testExactDutyEndpointsAcrossStopAndRestart},
         {"failed GPIO isolation retains uncertain ownership", testFailedIsolationNeverClaimsDisabledOrReleasesOwnership},
         {"restart requires events and a fault-free enable", testRestartRequiresNewTimerEventsAndFaultFreeEnable},

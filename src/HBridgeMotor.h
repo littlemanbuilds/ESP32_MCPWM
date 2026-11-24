@@ -450,9 +450,11 @@ class HBridgeMotor : public IMotorDriver
      * @param enable Desired logical bridge-enable state.
      * @param a_percent A-channel duty in percent.
      * @param b_percent B-channel duty in percent.
+     * @param suppress_pwm Disconnect the owned pads before writing compare values.
      * @return Commit, stale-generation, or hardware-failure outcome.
      */
-    OutputCommitResult writeHardwareOutput(uint32_t sequence, bool enable, float a_percent, float b_percent) noexcept;
+    OutputCommitResult writeHardwareOutput(uint32_t sequence, bool enable, float a_percent, float b_percent,
+                                           bool suppress_pwm = false) noexcept;
 
     /**
      * @brief Publish and synchronously commit one hardware output request.
@@ -460,9 +462,24 @@ class HBridgeMotor : public IMotorDriver
      * @param enable Desired logical bridge-enable state.
      * @param a_percent A-channel duty in percent.
      * @param b_percent B-channel duty in percent.
+     * @param suppress_pwm Disconnect the owned pads before writing compare values.
+     * @param allow_fault Permit restoring a quiet route for the configured emergency brake.
      * @return True when the request reached the hardware commit boundary.
      */
-    bool commandOutput(bool enable, float a_percent, float b_percent) noexcept;
+    bool commandOutput(bool enable, float a_percent, float b_percent, bool suppress_pwm = false,
+                       bool allow_fault = false) noexcept;
+
+    /// @brief Identify ordinary EN-controlled PWM where coast can take ownership of the pad routes.
+    ///
+    /// @return True when no configured peripheral fault or dead-time action needs those routes.
+    bool canSuppressCoast() const noexcept;
+
+    /// @brief Restore coast-muted routes after verified zero, temporarily releasing the state lock.
+    ///
+    /// @param sequence Current output generation. The caller holds the state lock once.
+    /// @param allow_fault Permit a latched fault for the configured emergency brake.
+    /// @return Commit eligibility, a superseding command or fault, or a hardware failure.
+    OutputCommitResult restoreCoastRoutes(uint32_t sequence, bool allow_fault = false) noexcept;
 
     /**
      * @brief Apply the newest timer command when the supplied generation is stale.
@@ -599,6 +616,11 @@ class HBridgeMotor : public IMotorDriver
     /// @return True when both pins were isolated successfully.
     bool isolatePwm() noexcept;
 
+    /// @brief Route both output pads to low GPIO latches with the state lock held.
+    ///
+    /// @return True if both low levels were staged and both routes disconnected.
+    bool routePwmLow() noexcept;
+
     /// @brief Request stop at zero and wait for the owned timer's stop event.
     ///
     /// @return True when stopped, or false with the reservation retained for recovery.
@@ -696,6 +718,7 @@ class HBridgeMotor : public IMotorDriver
     bool timer_stop_pending_{false};      ///< Stop requested, hardware event still outstanding.
     bool timer_recovery_required_{false}; ///< Partial containment blocks commands until stop or setup is retried.
     bool pwm_isolated_{false};            ///< Both PWM pins routed to low GPIO latches.
+    bool pwm_coast_suppressed_{false};    ///< Running PWM pads temporarily held low during coast.
     bool deadtime_enabled_{false};        ///< True while dead-time requires explicit teardown.
     bool hardware_fault_mode_configured_{false}; ///< Brake action tables require neutralization on teardown.
     bool hardware_fault_enabled_{false};  ///< True while the MCPWM peripheral fault path is configured.

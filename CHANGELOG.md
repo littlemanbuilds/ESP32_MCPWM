@@ -4,6 +4,20 @@ All notable changes to ESP32_MCPWM are documented here.
 
 ## [Unreleased]
 
+## [2.1.1] - 2026-11-24
+
+### Fixed
+
+- Withdraw EN first and promptly suppress both PWM pads during ordinary
+  EN-controlled HiZ coast, software fault coast, and stop before staging zero duty.
+- Confirm a quiet timer boundary before restoring PWM for fresh demand after
+  coast, keeping pending comparator values from reappearing on the pads.
+
+### Added
+
+- Shutdown and restoration regressions covering buffered duty updates, timer
+  phases, both PWM routes, and faults during restoration.
+
 ## [2.1.0] - 2026-11-22
 
 ### Added

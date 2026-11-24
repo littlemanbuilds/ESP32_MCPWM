@@ -158,6 +158,7 @@ enum class EventKind
     DigitalWrite,
     GpioLatch,
     McpwmGpioInit,
+    PwmMatrix,
     McpwmInit,
     DeadtimeEnable,
     DeadtimeDisable,

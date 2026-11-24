@@ -14,10 +14,10 @@
 
 // ---- Version ---- //
 
-#define ESP32_MCPWM_VERSION "2.1.0"
+#define ESP32_MCPWM_VERSION "2.1.1"
 #define ESP32_MCPWM_VERSION_MAJOR 2
 #define ESP32_MCPWM_VERSION_MINOR 1
-#define ESP32_MCPWM_VERSION_PATCH 0
+#define ESP32_MCPWM_VERSION_PATCH 1
 
 #include "HBridgeMotor.h"
 #include "IMotorDriver.h"

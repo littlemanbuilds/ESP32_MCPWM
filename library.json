@@ -1,6 +1,6 @@
 {
   "name": "ESP32_MCPWM",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "Explicit Arduino-ESP32 MCPWM H-bridge control with structured operation results, software and hardware fault paths, coast/brake modes, runtime retuning, capture, and diagnostics.",
   "keywords": [
     "arduino",
